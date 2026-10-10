@@ -1,0 +1,16 @@
+# Build output
+target/
+
+# IDE
+.idea/
+*.iml
+*.ipr
+*.iws
+
+# Logs & JVM crash dumps
+*.log
+hs_err_pid*
+replay_pid*
+
+# Backup archives
+*.zip

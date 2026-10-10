@@ -1,0 +1,101 @@
+# 空间/参数一致性校验流程示例: **聚合节点(group)** 版
+#
+# 形状结论(为什么这么写):
+#  - 一个校验项 = 一个聚合节点。校验项内部的多个步骤(取源端 / 逐片对比)是它的**子节点**,
+#    对外只暴露一个名字: flow 里写一项、进度 groups 视图里一项一行、errorPolicy 与组级 when 一处声明。
+#  - 组内子节点**串行**执行, 但引擎**不**自动传递 result(无冒泡): 前一步要把结论交给后一步,
+#    由 handler 显式放置——ctx.node().parent().putResult("fetchSource", map) 挂进组桶
+#    (ctx.upward() 只到所属子节点自己的桶, 兄弟读不到), 后一步写 ${result.fetchSource.bytes}
+#    沿父链上溯即可读到; 走流程级则 ctx.putVar(...) -> ${vars.<k>}。
+#  - 并行只发生在**分片子节点的 lane 之间**(laneExecution: PARALLEL)与**校验项之间**(flow 里的 PARALLEL)。
+#    节点内 action 序列永远串行, 所以"取源端一次 + 逐片对比"必须是两个子节点, 不能是同一节点的两个 action。
+#  - 匿名 PARALLEL 没有就近声明的挂靠点, 收敛策略一律吃上面的全局 errorPolicy。要**只改某一条并行**的收敛,
+#    在关键字后挂命名后缀(后缀 = nodes 下的一条纯容器声明), 于是它也能像聚合节点那样自带策略/when/config/监听器:
+#      flow: "PARALLEL:checks(spaceCheck,rowCountCheck)"
+#      nodes.checks: { name: 校验清单, errorPolicy: CONTINUE_ON_ERROR }
+#    后缀写错或声明了却没引用, 装载期就报 AU204212/AU204213(不留"策略设了没生效"拖到运行期)。
+#    下面的 spaceCheck/rowCountCheck 自己是聚合节点, 在 flow 里就展开成 GROUP:spaceCheck(...) 这种带名串行容器。
+#  - 源端不进分片轴: 分片轴 = 需要产出结论的那一侧(目标端), 于是"对比时不比源端"天然成立,
+#    不需要 action 级分片过滤(引擎也没有这个字段)。
+#
+# 装载期展开(DefinitionLoader.expandGroups): 本文件的 flow 会被重写成
+#   PARALLEL(GROUP(spaceCheck,spaceCheck.fetchSource,spaceCheck.diffPerShard),GROUP(rowCountCheck,...))
+# 且 group.nodes 下的子节点被提升进顶层 nodes(键 = "<组>.<子>")。两者都是可序列化字段,
+# 所以定义 JSON 快照自带展开结果——缓存借出的副本重解析 flow 也是同一棵树。
+
+materialization: EAGER          # 创建期建全整棵节点树(含组与组的子节点), 节点级分母稳定; lane/action 驱动期建
+errorPolicy: CONTINUE_ON_ERROR  # 校验类流程: 逐项跑完才看得到全貌(组自己可覆盖)
+
+# 校验项清单/结论走业务专表, 不占节点:
+#  before 批量插校验项(可读 ctx.nodes() 拿全量拓扑), after 由 action 级监听器逐片回写状态。
+listeners:
+  - name: checkItemInitializer
+    config:
+      itemTable: t_validate_item
+
+vars:
+  tolerance: 0.05
+
+flow: "PARALLEL(spaceCheck,rowCountCheck)"
+
+nodes:
+  # ===================== 校验项 1: 空间占用 =====================
+  spaceCheck:
+    name: 空间占用校验
+    errorPolicy: FAIL_FAST            # 本项内部遇坏即停(取不到源端就别对比); 其他校验项照跑(全局 CONTINUE_ON_ERROR)
+    # when: "${vars.skipSpace} == true"   # 组级 guard: 假则整组 SKIPPED(子节点一个也不物化)
+    # 组级共享 config: 子节点写 ${config.itemTable} 沿父链上溯即可读到(组桶在子节点的父链上)。
+    # ★别写成 cluster: "${config.cluster}" —— 键名与占位符路径同名会解出**自己那串原文**
+    #   (节点级 config 只做物化期 PLAN 解析, 不再二次解析); 创建参数本来就能被子节点直接 ${config.cluster} 读到。
+    config:
+      itemTable: t_validate_space
+      cluster: "${config.clusterName}"   # 要转写创建参数就换一个不同名的键
+    group:
+      flow: "fetchSource,diffPerShard"
+      nodes:
+        # 步骤1: 源端只查一次(不分片)。handler 内**显式**把结果挂进组桶:
+        #   ctx.node().parent().putResult("fetchSource", ImmutableMap.of("bytes", ..., "rows", ...))
+        # (action 自己的 result 只留在 action 行, 引擎不再自动上挂。)
+        fetchSource:
+          name: 取源端空间
+          handler: spaceProbeSource
+          config:
+            endpoint: "${config.sourceEndpoint}"
+
+        # 步骤2: 目标端逐片"查 + 比"合一, lane 之间并行。
+        # 读的是步骤1显式挂进组桶的值 -> ${result.fetchSource.bytes}(沿父链上溯, 激活期解析)。
+        diffPerShard:
+          name: 全分片空间对比
+          shard: targetTopology       # resolveShardKeys 只返回目标端; 返回空列表务必抛异常(否则节点静默 SUCCESS)
+          laneExecution: PARALLEL
+          actions:
+            - id: diffSpace
+              handler: spaceDiff
+              config:
+                srcBytes: "${result.fetchSource.bytes}"   # 组内直读(激活期解析)
+                tolerance: "${vars.tolerance}"
+              # action 级监听器(ActionListener): 每片跑完各触发一次, after 里能拿到 shardKey 与本片 verdict
+              listeners:
+                - name: checkItemRecorder
+
+  # ===================== 校验项 2: 行数 =====================
+  rowCountCheck:
+    name: 行数校验
+    group:
+      flow: "fetchSource,countPerShard"
+      nodes:
+        fetchSource:
+          name: 取源端行数
+          handler: rowCountSource       # 同 spaceCheck.fetchSource: 显式 ctx.node().parent().putResult("fetchSource", ...) 挂组桶
+        countPerShard:
+          name: 全分片行数对比
+          shard: targetTopology
+          laneExecution: PARALLEL
+          handler: rowCountDiff
+          config:
+            srcRows: "${result.fetchSource.rows}"   # 沿父链上溯读组桶里显式挂的值
+            tolerance: "${vars.tolerance}"
+
+# 汇总不占节点: 结论逐片落在 process_action_inst.result(handler putResult, 引擎落本行), 需要一张总表就由
+# checkItemRecorder(ActionListener.after) 回写; 前端轮询 facade.progress(procInstId) 拿
+# { total, done, percent, counts, groups: [ {name: 空间占用校验, status, total, done, percent, items}, ... ] }。

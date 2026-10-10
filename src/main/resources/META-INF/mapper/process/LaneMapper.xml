@@ -1,0 +1,81 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<!--
+  lane: 分片节点的同 shardKey 共享边界 + 调度实体。
+  findByNode 合并了原 findByNode / findByNodeAndShard(shardKey 非 null 时按唯一键 uk_node_shard 只取一条)。
+  updateState 合并了原 setStatus / casStatus / activate / updateStatusResult / updateResult。
+-->
+<mapper namespace="com.tesla.ities.process.mapper.LaneMapper">
+
+    <resultMap id="BaseResultMap" type="com.tesla.ities.process.domain.LaneEntity">
+        <id     property="autoId"       column="auto_id"/>
+        <id     property="laneId"       column="lane_id"/>
+        <result property="procInstId"   column="proc_inst_id"/>
+        <result property="nodeInstId"   column="node_inst_id"/>
+        <result property="shardKey"     column="shard_key"/>
+        <result property="status"       column="status"/>
+        <result property="errorPolicy"  column="error_policy"/>
+        <result property="config"       column="config"/>
+        <result property="result"       column="result"/>
+        <result property="creatorId"    column="creator_id"/>
+        <result property="updatorId"    column="updator_id"/>
+        <result property="createdAt"    column="created_at"/>
+        <result property="updatedAt"    column="updated_at"/>
+    </resultMap>
+
+    <sql id="columns">
+        auto_id, lane_id, proc_inst_id, node_inst_id, shard_key, status,
+        error_policy, config, result, creator_id, updator_id, created_at, updated_at
+    </sql>
+
+    <!-- 幂等物化: 命中 uk_node_shard 则忽略。creator_id = 流程创建人(建行人)。 -->
+    <insert id="insertIgnore" parameterType="com.tesla.ities.process.domain.LaneEntity">
+        INSERT IGNORE INTO ${orch.table.lane}(lane_id, proc_inst_id, node_inst_id, shard_key, status, error_policy, config, creator_id, updator_id)
+        VALUES(#{laneId}, #{procInstId}, #{nodeInstId}, #{shardKey}, #{status}, #{errorPolicy}, #{config}, #{creatorId}, #{updatorId})
+    </insert>
+
+    <select id="findById" resultMap="BaseResultMap">
+        SELECT <include refid="columns"/>
+        FROM ${orch.table.lane}
+        WHERE lane_id = #{id}
+    </select>
+
+    <!-- 某分片节点下的全部 lane(声明顺序); shardKey 非 null 时按 node + shardKey 定位单条(find-or-create 幂等物化用)。 -->
+    <select id="findByNode" resultMap="BaseResultMap">
+        SELECT <include refid="columns"/>
+        FROM ${orch.table.lane}
+        WHERE node_inst_id = #{nodeInstId}
+        <if test="shardKey != null">AND shard_key = #{shardKey}</if>
+        ORDER BY auto_id ASC
+        <if test="shardKey != null">LIMIT 1</if>
+    </select>
+
+    <!-- fromStatus 非 null = CAS(仅当前态匹配才翻); toStatus/result 至少给一个; updatorId 非 null 才刷审计列。 -->
+    <update id="updateState">
+        UPDATE ${orch.table.lane}
+        <set>
+            <if test="toStatus  != null">status = #{toStatus},</if>
+            <if test="result    != null">result = #{result},</if>
+            <if test="updatorId != null">updator_id = #{updatorId},</if>
+        </set>
+        WHERE lane_id = #{id}
+        <if test="fromStatus != null">AND status = #{fromStatus}</if>
+    </update>
+
+    <!-- ========== 以下为 lane 级认领路径(备用, 默认关闭; 见 #2) ========== -->
+
+    <update id="claim">
+        UPDATE ${orch.table.lane} l JOIN ${orch.table.processInst} p ON p.proc_inst_id = l.proc_inst_id
+        SET l.status = 'running'
+        WHERE l.lane_id = #{id} AND l.status = 'pending' AND p.status = 'running'
+    </update>
+
+    <select id="findClaimableLaneIds" resultType="java.lang.String">
+        SELECT l.lane_id
+        FROM ${orch.table.lane} l JOIN ${orch.table.processInst} p ON p.proc_inst_id = l.proc_inst_id
+        WHERE l.status = 'pending' AND p.status = 'running'
+        ORDER BY l.auto_id ASC
+        LIMIT #{limit}
+    </select>
+
+</mapper>

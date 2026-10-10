@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<!--
+  process_sched: 调度路由表(独立维护)。只有本表有行的流程才参与"主动调度"。
+  认领闸门/状态仍归 process_inst; 本表仅承载路由维度(sched_unit / sched_zone)。
+  表名经 ${orch.table.*} 变量装载期替换(ProcessEngineConfig.tablePrefix 可改命名空间)。
+  审计列: creator_id 只在插入时写; updator_id 由调用方显式下传(null = 不刷, 保留原值)。
+-->
+<mapper namespace="com.tesla.ities.process.mapper.ProcessSchedMapper">
+
+    <resultMap id="BaseResultMap" type="com.tesla.ities.process.domain.ProcessSchedEntity">
+        <id     property="autoId"     column="auto_id"/>
+        <id     property="procInstId" column="proc_inst_id"/>
+        <result property="schedUnit"  column="sched_unit"/>
+        <result property="schedZone"  column="sched_zone"/>
+        <result property="creatorId"  column="creator_id"/>
+        <result property="updatorId"  column="updator_id"/>
+        <result property="createdAt"  column="created_at"/>
+        <result property="updatedAt"  column="updated_at"/>
+    </resultMap>
+
+    <sql id="columns">
+        auto_id, proc_inst_id, sched_unit, sched_zone,
+        creator_id, updator_id, created_at, updated_at
+    </sql>
+
+    <insert id="insert" parameterType="com.tesla.ities.process.domain.ProcessSchedEntity">
+        INSERT INTO ${orch.table.processSched}(proc_inst_id, sched_unit, sched_zone, creator_id, updator_id)
+        VALUES(#{procInstId}, #{schedUnit}, #{schedZone}, #{creatorId}, #{updatorId})
+    </insert>
+
+    <select id="findByProcInstId" resultMap="BaseResultMap">
+        SELECT <include refid="columns"/>
+        FROM ${orch.table.processSched}
+        WHERE proc_inst_id = #{procInstId}
+    </select>
+
+    <delete id="deleteByProcInstId">
+        DELETE FROM ${orch.table.processSched}
+        WHERE proc_inst_id = #{procInstId}
+    </delete>
+
+</mapper>

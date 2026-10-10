@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<!--
+  rollback_record: 回退/补偿历史(#16)。每个补偿步骤一行, 关联原 action_inst(不改其状态)。
+  find 合并了原 findByProcess / findLatestByAction(两个条件都可选, 均按 auto_id = 补偿执行顺序升序)。
+  注: 本表 status 是补偿状态机(RollbackStatus 枚举), 不属于实例运行态 Status 枚举;
+    入参是小写规范值字符串(调用方传 RollbackStatus.getStatus(), SQL 普通 #{to} 绑定)。
+-->
+<mapper namespace="com.tesla.ities.process.mapper.RollbackRecordMapper">
+
+    <resultMap id="BaseResultMap" type="com.tesla.ities.process.domain.RollbackRecordEntity">
+        <id     property="autoId"        column="auto_id"/>
+        <id     property="rollbackId"    column="rollback_id"/>
+        <result property="procInstId"    column="proc_inst_id"/>
+        <result property="actionInstId"  column="action_inst_id"/>
+        <result property="actionDefId"   column="action_def_id"/>
+        <result property="status"        column="status"/>
+        <result property="operator"      column="operator"/>
+        <result property="detail"        column="detail"/>
+        <result property="creatorId"     column="creator_id"/>
+        <result property="updatorId"     column="updator_id"/>
+        <result property="createdAt"     column="created_at"/>
+        <result property="updatedAt"     column="updated_at"/>
+    </resultMap>
+
+    <sql id="columns">
+        auto_id, rollback_id, proc_inst_id, action_inst_id, action_def_id,
+        status, operator, detail, creator_id, updator_id, created_at, updated_at
+    </sql>
+
+    <insert id="insert" parameterType="com.tesla.ities.process.domain.RollbackRecordEntity"
+            useGeneratedKeys="true" keyProperty="autoId" keyColumn="auto_id">
+        INSERT INTO ${orch.table.rollbackRecord}(rollback_id, proc_inst_id, action_inst_id, action_def_id, status, operator, detail, creator_id, updator_id)
+        VALUES(#{rollbackId}, #{procInstId}, #{actionInstId}, #{actionDefId}, #{status}, #{operator}, #{detail}, #{creatorId}, #{updatorId})
+    </insert>
+
+    <update id="updateStatus">
+        UPDATE ${orch.table.rollbackRecord} SET status = #{to}, detail = #{detail}
+        <if test="updatorId != null">, updator_id = #{updatorId}</if>
+        WHERE rollback_id = #{id}
+    </update>
+
+    <select id="find" resultMap="BaseResultMap">
+        SELECT <include refid="columns"/>
+        FROM ${orch.table.rollbackRecord}
+        <where>
+            <if test="procInstId   != null">AND proc_inst_id = #{procInstId}</if>
+            <if test="actionInstId != null">AND action_inst_id = #{actionInstId}</if>
+        </where>
+        ORDER BY auto_id ASC
+    </select>
+
+</mapper>

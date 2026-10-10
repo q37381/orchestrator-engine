@@ -1,0 +1,86 @@
+# 校验流程示例: EAGER 提前物化全部节点(CREATED), 前端轮询 progress 展示完整进度(#4)
+# 对应讨论: "校验项有专门的一张表 -> ProcessListener.before 批量插入, ActionListener.after 逐项回写状态"
+#
+# v1.2(#3): 不再在 YAML 里写 processDefinition / version —— 以 process_definition 表的列为准。
+
+# EAGER: 创建期节点树整树入库, 所有校验项节点创建即 CREATED -> 节点级分母稳定; lane/action 执行到才建。
+materialization: EAGER
+
+# 全局错误策略: 声明一次, **没自己写 errorPolicy 的节点都用它**(含匿名 PARALLEL/IF 控制节点与其分片 lane);
+# 节点自己写了则**覆盖**全局(如某个校验失败就必须停的节点单独写 FAIL_FAST)。校验类流程逐项跑完才看得到全貌,
+# 所以这里整流程默认 CONTINUE_ON_ERROR, 下面几个校验节点就不再需要重复声明。两者都没声明才是 FAIL_FAST。
+# 要只改**某一条并行**的收敛(而不是整流程): flow 里在关键字后挂命名后缀 PARALLEL:标签(a,b),
+# 后缀指向 nodes 下的一条纯容器声明, 在那里写 errorPolicy/when/config——匿名并行才只能吃这一行的全局值。
+# (命名写在括号之前, 括号里就只剩执行形状; GROUP 同理写 GROUP:名字(子项...), 名字挪到括号外的缘由见 DslParser 类注释)
+errorPolicy: CONTINUE_ON_ERROR
+
+# vars 统一变量空间(#7): 方言包放 vars.dialects(只是本例自己起的名字, 引擎不认识任何保留键);
+# 采样率等普通变量放顶层。物化期 ${vars.*} 就地替换落库(#12), 运行期再解 ${result.*}(只读本层沿父链, 跨层共享靠显式放置)
+# 与新写入的 vars;
+# 创建输入落在**流程级 config**(${config.*} 本层优先、沿父链上溯, 两档都解得开)。
+vars:
+  sampleRate: 0.1
+  dialect: mysql
+  dialects:
+    mysql:
+      checksumSql: "CHECKSUM TABLE ${table}"
+    goldendb:
+      checksumSql: "GDB CHECKSUM ${table}"
+
+# 审计跟踪已改为全局 Observer(AuditTrailObserver), 无需在 YAML 声明, 自动对所有流程/节点/action 生效。
+# 若仍需流程级 Listener(可否决/带 config), 可在此声明 listeners 链。
+
+# flow: 节点执行顺序(原 body, 命名提升)。顶层逗号扁平化为多个根节点。
+flow: "loadMeta,PARALLEL(schemaCheck,rowCountCheck,checksumCheck),summary"
+
+nodes:
+  loadMeta:
+    name: 加载元数据                          # 展示名(可选): 给进度/日志/监听器看, 不影响 flow 引用
+    actions:
+      - id: loadTables
+        handler: sqlCheck
+        # 不用 output: 提升; action 间相互隔离, result 只在本 action 行;
+        # 后续同节点 action 要读需 handler 显式 ctx.upward().putResult(...) 挂节点桶, 跨节点用 putVar
+        config:
+          sql: "SELECT table_name FROM information_schema.tables WHERE table_schema='${config.db}'"   # 读流程创建参数
+
+  schemaCheck:
+    name: 表结构校验
+    shard: dbTopology
+    laneExecution: PARALLEL                 # 各分片校验并行(#6); 默认 SERIAL
+    # 不写 errorPolicy: 直接吃顶部全局 CONTINUE_ON_ERROR(分片 lane 也继承同一个生效值)
+    actions:
+      - id: compareSchema
+        handler: sqlCheck
+        # action 级监听器 = ActionListener(只收 ActionContext, #4): after 逐项把状态回写校验专表; 按声明顺序执行
+        listeners:
+          - name: authGuard
+        config:
+          sql: "SHOW CREATE TABLE ${table}"
+
+  rowCountCheck:
+    name: 行数校验
+    shard: dbTopology
+    laneExecution: PARALLEL
+    actions:
+      - id: countRows
+        handler: sqlCheck
+        config:
+          sql: "SELECT COUNT(*) FROM ${table}"
+
+  checksumCheck:
+    shard: dbTopology
+    laneExecution: PARALLEL
+    actions:
+      - id: checksum
+        handler: sqlCheck
+        config:
+          sql: "${vars.dialects.${vars.dialect}.checksumSql}"   # 间接键: 先把 vars.dialect 插进路径, 再取那一支片段
+          sampleRate: "${vars.sampleRate}"
+
+  summary:
+    actions:
+      - id: aggregate
+        handler: sqlCheck
+        config:
+          mode: summarize

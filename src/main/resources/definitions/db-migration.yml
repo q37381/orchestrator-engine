@@ -1,0 +1,170 @@
+# 数据库迁移流程示例: mysql / goldendb 方言 + 按 dbTopology 分片 + IF 分支
+# 单流程 + vars 方言注入 + IF, 不做模板继承/片段覆盖(讨论结论)
+#
+# v1.2(#3): 不再在 YAML 里写 processDefinition / version —— 以 process_definition 表的
+#           (process_def_id, version) 列为准, 创建/发布时外部传入, 自动关联。
+
+# LAZY: 只建 root, 节点/lane/action 在被驱动到那一层时才物化(#4)。
+# 分片 shardKey 依赖运行期产生的拓扑, 惰性物化才能拿到正确的 lane。
+materialization: LAZY
+
+# 可选的全局错误策略(本例没声明, 即默认 FAIL_FAST): 写了就对**没自己声明 errorPolicy 的节点**生效
+# (含 PARALLEL/IF 控制节点与其分片 lane), 节点自己的声明优先——本例逐节点写清了, 所以不吃全局。
+# errorPolicy: CONTINUE_ON_ERROR
+
+# vars: 流程级变量空间, 物化期与运行期(handler putVar)都可解析/写入(#7); ${vars.*} 在物化期就地替换成字面量(#12)。
+# config: 各层落库的配置桶**同名**, ${config.*} 本层优先、沿父链上溯 —— 流程级 config 就是创建输入,
+#   所以节点/action 里写 ${config.cluster} 就能拿到 create 时传的 cluster(任何阶段都解得开)。
+# params: 四张实例表都**不建 params 列**, 它只是上下文里的运行期参数桶; ${params.*} 靠创建参数并入的
+#   baseVars 在物化期解出(激活期解不开), 要跨阶段读创建参数请用 ${config.*}。
+# 多方言片段就放在 vars 下(本例取名 dialects, 引擎不认识任何保留键名), 选哪一支靠**间接键**:
+#   ${vars.dialects.${vars.dialect}.lockSql}   先把 vars.dialect 插进路径, 再按合成后的路径取值
+# 指针变量未定时整条原样保留 -> 天然拖到激活期, 所以流程体不写死方言名。
+vars:
+  batchSize: 5000
+  parallelLanes: 4
+  # dialect 可留空, 由前置步骤检测到数据库类型后 ctx.putVar("dialect", "goldendb")
+  dialect: mysql          # 静态写定 = 物化期就按它插值, 整条冻结成 mysql 那支; 想用运行期检测的方言则删掉本行
+  dialects:
+    mysql:
+      lockSql: "ALTER TABLE ${table} DISABLE KEYS"
+      unlockSql: "ALTER TABLE ${table} ENABLE KEYS"
+      migrateSql: "INSERT INTO ${table} SELECT * FROM ${srcDb}.${table}"
+    goldendb:
+      lockSql: "SET TABLE ${table} READONLY"
+      unlockSql: "SET TABLE ${table} READWRITE"
+      migrateSql: "COPY ${srcDb}.${table} TO ${table}"
+
+# 审计跟踪已改为全局 Observer(AuditTrailObserver), 无需在 YAML 声明。
+# 若仍需流程级 Listener(可否决/带 config), 可在此声明 listeners 链。
+#
+# 回退前置: 补偿路径不走 flow, setup/setdown 与流程/节点/action 三类监听器在回退时一个也不触发,
+# 靠这一段拿回退自己的 before/after(RollbackListener, 按声明顺序):
+# rollbackListeners:
+#   - name: dbConnFetcher      # before: 现查连接信息 -> ctx.putResult("dbConn", conn)(只进内存桶, 引擎不刷回库)
+#     config:                  # after : 纯通知, 收 outcome(success/stopped/failed)
+#       source: cmdb           # before 抛异常 = 否决整轮回退(报告里 veto 字段有原因)
+# 下游 compensate 里 ctx.resolveResult("dbConn.host") 读; action config 写 ${result.dbConn.host} 也会在补偿前解析。
+
+# flow: 节点执行顺序(原 body, 命名优化)。顶层逗号扁平化为多个根节点(按声明顺序串行驱动);
+# PARALLEL(...) 并行, IF(cond,then,else) 条件分支。
+flow: "fetchTopology,preCheck,PARALLEL(migrateData,buildIndex),postCheck,IF(${vars.dialect}=='goldendb',gdbVerify,mysqlVerify)"
+
+# setup/setdown: 前置/收尾动作(均为 nodes 下声明的节点引用, 默认即 ACTION, 无需写 type)。
+# setup 在 flow 之前按序执行; setdown 类似 finally, 无论成败都执行(例: 清理锁/回写状态)。
+setup:
+  - initTopology
+
+setdown:
+  - finalizeReport
+
+nodes:
+  # name = 展示名(可选): 未声明则回落节点 id(map 键); id 才是 flow DSL 里的引用键, 改名不用动 flow。
+  # 定义级属性, 不落实例表(同监听器链)——监听器/handler 经 ctx.nodes()/NodeContext.name() 读。
+  initTopology:
+    name: 初始化拓扑
+    actions:
+      - id: checkTopology
+        handler: sqlCheck
+        config:
+          sql: "SELECT 1 FROM information_schema.tables LIMIT 1"   # 前置: 确认拓扑可达
+
+  fetchTopology:
+    actions:
+      - id: queryTopology
+        handler: sqlCheck
+        # 不再用 output: 提升。action 间相互隔离, result 只留在本 action 行;
+        # 要跨 action/跨节点共享, 在 handler 内显式放置: ctx.putVar(...) -> ${vars.<k>},
+        # 或 ctx.upward().putResult(k, v) 挂到所属节点/lane 桶 -> ${result.<k>}(组内交接用 ctx.node().parent())。
+        config:
+          sql: "SELECT host, port, role FROM db_topology WHERE cluster = '${config.cluster}'"   # 读流程创建参数(上溯到流程级 config)
+
+  preCheck:
+    name: 前置校验
+    shard: dbTopology                        # 运行期 resolveShardKeys + buildPayload(不落库, #1)
+    laneExecution: SERIAL                    # 分片 lane 逐条串行(默认, #6); 改 PARALLEL 则各 lane 并行
+    errorPolicy: FAIL_FAST
+    # 节点级监听器 = NodeListener(只收 NodeContext), 仅对本节点生效(#4); 按声明顺序执行
+    listeners:
+      - name: authGuard
+    actions:
+      - id: checkUser
+        handler: userChecker
+        config:
+          endpoint: "${lane.shardKey}"
+        # action 间相互隔离: checkUser 的 result 不再自动挂节点桶, guard 要读它需**显式交接**——
+        # 本例约定 handler 内 ctx.putVar("userExists", ...) / ctx.putVar("userHasPrivilege", ...)
+      - id: createUser                       # 声明式守卫: 无用户才执行(guard 读上一步显式写的 vars)
+        handler: userChecker
+        when: "${vars.userExists} == false"      # 操作数必须带 ${}: 求值器只替换占位符, 裸路径会被当字符串比较
+        config:
+          action: create
+      - id: grantPrivilege                   # 无权限才执行; 有用户且有权限则整段自然跳过
+        handler: userChecker
+        when: "${vars.userHasPrivilege} == false"
+        config:
+          action: grant
+
+  migrateData:
+    name: 数据迁移
+    shard: dbTopology
+    laneExecution: PARALLEL                  # 迁移各分片可并行(#6)
+    errorPolicy: CONTINUE_ON_ERROR
+    # 片段也可**就近声明在本 action 的 config 里**(字典键名完全面向业务, 引擎无特权名):
+    #   config:
+    #     sqlByType:
+    #       mysql:    { lock: "ALTER TABLE ${vars.table} DISABLE KEYS" }
+    #       goldendb: { lock: "SET TABLE ${vars.table} READONLY" }
+    #     sql: "${config.sqlByType.${vars.dialect}.lock}"
+    # ${config.*} 只在激活期解析 -> 运行期按指针变量选一支, 选中那支里的 ${vars.table} 再填真实值。
+    actions:
+      - id: disableKeys
+        handler: sqlCheck
+        config:
+          sql: "${vars.dialects.${vars.dialect}.lockSql}"     # 间接键选方言片段(#7)
+      - id: migrate
+        handler: dbMigrate                   # MysqlMigHandler: 内部分批 + isCancelled() 自愿检查
+        config:
+          sql: "${vars.dialects.${vars.dialect}.migrateSql}"
+          batchSize: "${vars.batchSize}"
+      - id: enableKeys
+        handler: sqlCheck
+        config:
+          sql: "${vars.dialects.${vars.dialect}.unlockSql}"
+
+  buildIndex:
+    shard: dbTopology
+    actions:
+      - id: rebuildIndex
+        handler: sqlCheck
+        config:
+          sql: "ANALYZE TABLE ${table}"
+
+  postCheck:
+    shard: dbTopology
+    actions:
+      - id: rowCountCheck
+        handler: sqlCheck
+        config:
+          sql: "SELECT COUNT(*) FROM ${table}"
+
+  gdbVerify:
+    actions:
+      - id: gdbVerifyStep
+        handler: sqlCheck
+        config:
+          sql: "GDB VERIFY ${table}"
+
+  mysqlVerify:
+    actions:
+      - id: mysqlVerifyStep
+        handler: sqlCheck
+        config:
+          sql: "CHECK TABLE ${table}"
+
+  finalizeReport:
+    actions:
+      - id: writeReport
+        handler: sqlCheck
+        config:
+          sql: "INSERT INTO migrate_report(proc_inst_id, status) VALUES('${vars.procInstId}', '${vars.lastStatus}')"   # 收尾: 无论成败都回写状态

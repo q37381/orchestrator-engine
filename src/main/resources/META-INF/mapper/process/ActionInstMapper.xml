@@ -1,0 +1,107 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<!--
+  action_inst: action 实例行。声明顺序由 auto_id 承载(与定义 actions 按下标对齐), 查询一律 ORDER BY auto_id ASC。
+  findInContainer 合并了原 findInContainer / findByContainerAndDef(自然键定位时 actionDefId 非 null, 只取一条);
+  containerMatch 用 laneId=null -> lane_id IS NULL 的等值分支取代原 (#{laneId} IS NULL AND lane_id IS NULL) OR ...,
+  既保持"非分片行 lane_id 为 NULL"的语义, 又能命中 idx_container 索引。
+  updateState 合并了原 setStatus / casStatus / activate / updateResult; 落 result 时同句 bump visit_count(重跑观测)。
+-->
+<mapper namespace="com.tesla.ities.process.mapper.ActionInstMapper">
+
+    <resultMap id="BaseResultMap" type="com.tesla.ities.process.domain.ActionInstEntity">
+        <id     property="autoId"        column="auto_id"/>
+        <id     property="actionInstId"  column="action_inst_id"/>
+        <result property="nodeInstId"    column="node_inst_id"/>
+        <result property="laneId"        column="lane_id"/>
+        <result property="actionDefId"   column="action_def_id"/>
+        <result property="name"          column="name"/>
+        <result property="handlerName"   column="handler_name"/>
+        <result property="shardKey"      column="shard_key"/>
+        <result property="status"        column="status"/>
+        <result property="whenExpr"      column="when_expr"/>
+        <result property="visitCount"    column="visit_count"/>
+        <result property="config"        column="config"/>
+        <result property="result"        column="result"/>
+        <result property="creatorId"     column="creator_id"/>
+        <result property="updatorId"     column="updator_id"/>
+        <result property="createdAt"     column="created_at"/>
+        <result property="updatedAt"     column="updated_at"/>
+    </resultMap>
+
+    <sql id="columns">
+        auto_id, action_inst_id, node_inst_id, lane_id, action_def_id, name, handler_name,
+        shard_key, status, when_expr, visit_count, config, result,
+        creator_id, updator_id, created_at, updated_at
+    </sql>
+
+    <!-- 容器(lane 或非分片 node)定位谓词。 -->
+    <sql id="containerMatch">
+        node_inst_id = #{nodeInstId}
+        <choose>
+            <when test="laneId == null">AND lane_id IS NULL</when>
+            <otherwise>AND lane_id = #{laneId}</otherwise>
+        </choose>
+    </sql>
+
+    <!-- 幂等物化: 命中 uk_node_def_shard 则忽略。声明顺序由 auto_id 升序承载。
+         注: 非分片行 shard_key=NULL 时唯一键不去重, 建行前须先 findInContainer(node, lane, def) 查存在。 -->
+    <insert id="insertIgnore" parameterType="com.tesla.ities.process.domain.ActionInstEntity"
+            useGeneratedKeys="true" keyProperty="autoId" keyColumn="auto_id">
+        INSERT IGNORE INTO ${orch.table.actionInst}(action_inst_id, node_inst_id, lane_id, action_def_id, name, handler_name,
+                                       shard_key, status, when_expr, config, creator_id, updator_id)
+        VALUES(#{actionInstId}, #{nodeInstId}, #{laneId}, #{actionDefId}, #{name}, #{handlerName},
+               #{shardKey}, #{status}, #{whenExpr}, #{config}, #{creatorId}, #{updatorId})
+    </insert>
+
+    <select id="findById" resultMap="BaseResultMap">
+        SELECT <include refid="columns"/>
+        FROM ${orch.table.actionInst}
+        WHERE action_inst_id = #{id}
+    </select>
+
+    <!-- 容器内全部 action(按声明顺序); actionDefId 非 null 时按自然键 (node, lane, actionDefId) 只取一条。 -->
+    <select id="findInContainer" resultMap="BaseResultMap">
+        SELECT <include refid="columns"/>
+        FROM ${orch.table.actionInst}
+        WHERE <include refid="containerMatch"/>
+        <if test="actionDefId != null">AND action_def_id = #{actionDefId}</if>
+        ORDER BY auto_id ASC
+        <if test="actionDefId != null">LIMIT 1</if>
+    </select>
+
+    <!-- action 列表: nodeInstId / actionInstId 两个条件都可选(通常传其一), 按声明顺序升序;
+         不按 lane 收窄, 故与 findInContainer 的容器谓词(lane_id IS NULL/等值)是两条不同口径。
+         用 <where>(不是裸 WHERE): 两个条件都可空, 它会在整段为空时省掉 WHERE、并剥掉首个 AND。 -->
+    <select id="find" resultMap="BaseResultMap">
+        SELECT <include refid="columns"/>
+        FROM ${orch.table.actionInst}
+        <where>
+            <if test="nodeInstId   != null">AND node_inst_id = #{nodeInstId}</if>
+            <if test="actionInstId != null">AND action_inst_id = #{actionInstId}</if>
+        </where>
+        ORDER BY auto_id ASC
+    </select>
+
+    <!-- fromStatus 非 null = CAS(仅当前态匹配才翻); 落 result 时 visit_count++(观测重跑); updatorId 非 null 才刷审计列。 -->
+    <update id="updateState">
+        UPDATE ${orch.table.actionInst}
+        <set>
+            <if test="toStatus  != null">status = #{toStatus},</if>
+            <if test="result    != null">result = #{result}, visit_count = visit_count + 1,</if>
+            <if test="updatorId != null">updator_id = #{updatorId},</if>
+        </set>
+        WHERE action_inst_id = #{id}
+        <if test="fromStatus != null">AND status = #{fromStatus}</if>
+    </update>
+
+    <!-- ========== 以下为 action 级认领路径(备用, 默认关闭; 见 #2) ========== -->
+
+    <update id="claim">
+        UPDATE ${orch.table.actionInst} a JOIN ${orch.table.nodeInst} n ON n.node_inst_id = a.node_inst_id
+                             JOIN ${orch.table.processInst} p ON p.proc_inst_id = n.proc_inst_id
+        SET a.status = 'running', a.visit_count = a.visit_count + 1
+        WHERE a.action_inst_id = #{id} AND a.status = 'pending' AND p.status = 'running'
+    </update>
+
+</mapper>

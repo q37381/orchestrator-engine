@@ -1,0 +1,79 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<!--
+  process_inst: 流程实例(闸门 + 认领)。状态字面量一律小写(Status.getStatus())。
+  表名经 ${orch.table.*} 变量装载期替换(ProcessEngineConfig.tablePrefix 可改命名空间)。
+  updateState 合并了原 casStatus / claim / updateResult / updateVars 四条语句: 只写传入的非 null 列。
+  审计列: creator_id 只在插入时写(= 创建流程时传入的 userId); updator_id 由调用方从上下文显式下传
+  给 updateState(驱动期=流程创建人, 干预期=操作人; null = 不刷, 保留原值)。
+-->
+<mapper namespace="com.tesla.ities.process.mapper.ProcessInstMapper">
+
+    <resultMap id="BaseResultMap" type="com.tesla.ities.process.domain.ProcessInstEntity">
+        <id     property="autoId"       column="auto_id"/>
+        <id     property="procInstId"   column="proc_inst_id"/>
+        <result property="processDefId" column="process_def_id"/>
+        <result property="defVersion"   column="def_version"/>
+        <result property="status"       column="status"/>
+        <result property="config"       column="config"/>
+        <result property="vars"         column="vars"/>
+        <result property="result"       column="result"/>
+        <result property="creatorId"    column="creator_id"/>
+        <result property="updatorId"    column="updator_id"/>
+        <result property="createdAt"    column="created_at"/>
+        <result property="updatedAt"    column="updated_at"/>
+    </resultMap>
+
+    <sql id="columns">
+        auto_id, proc_inst_id, process_def_id, def_version, status,
+        config, vars, result, creator_id, updator_id, created_at, updated_at
+    </sql>
+
+    <!-- config = 创建输入(与其他层同名同语义), 只在插入时写一次; params 桶不落库。 -->
+    <insert id="insert" parameterType="com.tesla.ities.process.domain.ProcessInstEntity">
+        INSERT INTO ${orch.table.processInst}(proc_inst_id, process_def_id, def_version, status, config, vars, result, creator_id, updator_id)
+        VALUES(#{procInstId}, #{processDefId}, #{defVersion}, #{status}, #{config}, #{vars}, #{result}, #{creatorId}, #{updatorId})
+    </insert>
+
+    <select id="findById" resultMap="BaseResultMap">
+        SELECT <include refid="columns"/>
+        FROM ${orch.table.processInst}
+        WHERE proc_inst_id = #{id}
+    </select>
+
+    <!-- fromStatus 非 null = CAS(仅当前态匹配才翻); toStatus/result/vars 至少给一个, 否则 SET 为空。 -->
+    <update id="updateState">
+        UPDATE ${orch.table.processInst}
+        <set>
+            <if test="toStatus  != null">status = #{toStatus},</if>
+            <if test="result    != null">result = #{result},</if>
+            <if test="vars      != null">vars = #{vars},</if>
+            <if test="updatorId != null">updator_id = #{updatorId},</if>
+        </set>
+        WHERE proc_inst_id = #{id}
+        <if test="fromStatus != null">AND status = #{fromStatus}</if>
+    </update>
+
+    <!-- 捞一批可认领(PENDING)的流程, 按 auto_id 升序。 -->
+    <select id="findClaimableIds" resultType="java.lang.String">
+        SELECT proc_inst_id
+        FROM ${orch.table.processInst}
+        WHERE status = 'pending'
+        ORDER BY auto_id ASC
+        LIMIT #{limit}
+    </select>
+
+    <!-- 路由认领: JOIN 调度表收窄到本 worker 能力(unit + zone); 闸门仍读 process_inst.status='pending'。
+         只调度"调度表里有行"的流程; 无调度行的流程不会被主动认领(仍可同步 start)。 -->
+    <select id="findClaimableIdsByRoute" resultType="java.lang.String">
+        SELECT i.proc_inst_id
+        FROM ${orch.table.processInst} i
+        JOIN ${orch.table.processSched} s ON s.proc_inst_id = i.proc_inst_id
+        WHERE i.status = 'pending'
+          AND s.sched_unit = #{unit}
+          AND s.sched_zone = #{zone}
+        ORDER BY i.auto_id ASC
+        LIMIT #{limit}
+    </select>
+
+</mapper>
