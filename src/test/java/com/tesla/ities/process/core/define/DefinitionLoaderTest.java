@@ -90,7 +90,7 @@ public class DefinitionLoaderTest {
         Assert.assertEquals("采样率作为普通变量放顶层", 0.1, ((Number) def.getVars().get("sampleRate")).doubleValue(), 0.0);
     }
 
-    /** 聚合节点示例: 一个校验项一个组, 组内子节点被提升、flow 被重写成 GROUP(...)。 */
+    /** 聚合节点示例: 一个校验项一个组, 组内子节点被提升、flow 被重写成 {@code GROUP:名(子项...)}。 */
     @Test
     public void spaceValidationExpandsGroupsAndKeepsContainerAttributes() {
         ProcessDefinition def = loadResource("definitions/space-validation.yml");
@@ -258,12 +258,12 @@ public class DefinitionLoaderTest {
     }
 
     /**
-     * 匿名容器与解不出定义的引用都不出声: 手写 {@code GROUP(anon,...)} 没对应 NodeDef = 纯串行容器;
+     * 匿名容器与解不出定义的引用都不出声: 手写 {@code GROUP:anon(...)} 没对应 NodeDef = 纯串行容器;
      * flow 里引用了 nodes 下不存在的键(ghost)留给驱动期报错, 这里不替引擎判错。
      */
     @Test
     public void flowOrderSkipsAnonymousContainersAndUndeclaredRefs() {
-        ProcessDefinition def = loader.load("flow: \"GROUP(anon,x,ghost),PARALLEL(y,GROUP(anon2,z))\"\n"
+        ProcessDefinition def = loader.load("flow: \"GROUP:anon(x,ghost),PARALLEL(y,GROUP:anon2(z))\"\n"
                 + "nodes:\n"
                 + "  x:\n    handler: h\n"
                 + "  y:\n    handler: h\n"

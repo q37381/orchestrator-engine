@@ -220,27 +220,33 @@ public class GroupDefinitionTest {
     @Test
     public void groupNeedsAtLeastOneChild() {
         try {
-            DslParser.parseFlow("GROUP(g)");
+            DslParser.parseFlow("GROUP:g()");
             Assert.fail("空聚合节点应当场报错");
-        } catch (ProcessException e) {
-            Assert.assertEquals("名称与子列表之间没有逗号", "AU204102", e.getMessageKey());
-        }
-        try {
-            DslParser.parseFlow("GROUP(g,)");
-            Assert.fail("尾随逗号也算没有子节点");
         } catch (ProcessException e) {
             Assert.assertEquals("AU204103", e.getMessageKey());
         }
+        try {
+            DslParser.parseFlow("GROUP:g(,)");
+            Assert.fail("括号里以逗号开头 = 子项位置空着");
+        } catch (ProcessException e) {
+            Assert.assertEquals("AU204105", e.getMessageKey());
+        }
     }
 
+    /**
+     * 名字必须写在括号**之外**: 旧写法 {@code GROUP(g,a,b)} 与"匿名容器带两个子项"文本一模一样,
+     * 静默按新规则解读会多物化一行组名(实例行与表达式错位), 所以缺命名后缀直接拒而不是猜。
+     */
     @Test
-    public void groupNeedsCommaAfterName() {
-        try {
-            DslParser.parseFlow("GROUP(g a)");
-            Assert.fail("缺少逗号分隔应当场报错");
-        } catch (ProcessException e) {
-            Assert.assertEquals("AU204102", e.getMessageKey());
-            Assert.assertTrue(e.getMessage(), e.getMessage().contains("g"));   // 参数已填进文案
+    public void groupNeedsNameOutsideParens() {
+        for (String flow : new String[]{"GROUP(g,a,b)", "GROUP(g a)", "GROUP(g)"}) {
+            try {
+                DslParser.parseFlow(flow);
+                Assert.fail("缺命名后缀应当场报错: " + flow);
+            } catch (ProcessException e) {
+                Assert.assertEquals(flow, "AU204102", e.getMessageKey());
+                Assert.assertTrue(e.getMessage(), e.getMessage().contains("GROUP"));   // 参数已填进文案
+            }
         }
     }
 

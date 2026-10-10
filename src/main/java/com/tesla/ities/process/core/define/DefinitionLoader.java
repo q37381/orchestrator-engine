@@ -29,6 +29,8 @@ import java.util.Set;
  *    生效链在消费点与本地声明合并(ProcessDefinition.mergeWithGlobals, 全局在前)。
  *  - 顶层 errorPolicy = **全局**错误策略(与节点同名属性同一个键名, 按层区分): 节点未声明则用它,
  *    在物化期烙进实例行的 error_policy 列(ProcessDefinition.effectiveErrorPolicy)。
+ *  - 顶层 autoRollback = **自动回退**开关(见 {@link #declaredSwitch}): 只认 true/false, 配了 true 就在驱动
+ *    终态为 FAILED/STOPPED 时由引擎自动逆序补偿(生效点在 ExecutionEngine, 不在本类)。
  *  - 节点可选 name(展示名); map 键仍作 id(flow DSL 的引用键), 两者互不影响。
  *  - **聚合节点(group)**: 节点声明 {@code group: {flow: ..., nodes: ...}} 即成为一个命名串行容器——
  *    对外仍是 flow 里的一个名字(一个校验项 = 一个节点), 内部各步骤是子节点。装载期展开:
@@ -60,6 +62,7 @@ public class DefinitionLoader {
         def.setSetdown((List<String>) root.get("setdown"));
         def.setFlow(str(root.get("flow")));
         def.setErrorPolicy(str(root.get("errorPolicy")));        // 全局错误策略(节点未声明时的回落)
+        def.setAutoRollback(declaredSwitch(root.get("autoRollback")));   // 自动回退开关
 
         Object mat = root.get("materialization");
         if (mat != null) {
@@ -409,6 +412,24 @@ public class DefinitionLoader {
 
     private String str(Object o) {
         return o == null ? null : String.valueOf(o);
+    }
+
+    /**
+     * 顶层布尔开关声明值(目前只有 autoRollback)的装载期校验: 只认 true / false(大小写不敏感)。
+     * 段没写 / 写了空白 = 没声明(回 null, 由消费点按关闭算); **写了但拼错当场拒** ——
+     * 静默当"没配"处理就等于"我明明配了自动回退, 失败了却没回退", 那种坑要拖到事故现场才看得见。
+     * 返回归一化的小写文本, 所以定义快照里永远存 true/false, 与 YAML 那行怎么写无关。
+     */
+    private String declaredSwitch(Object v) {
+        String s = str(v);
+        if (s == null || s.trim().isEmpty()) {
+            return null;
+        }
+        Boolean b = ProcessDefinition.parseSwitch(s);
+        if (b == null) {
+            throw new ProcessException("AU204214", s);
+        }
+        return b.toString();
     }
 
     /** 段写了但留空(null) / 整段缺失 一律回落空 map, 不给下游留 NPE 种子。 */

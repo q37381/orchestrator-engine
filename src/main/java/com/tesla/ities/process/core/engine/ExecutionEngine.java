@@ -60,6 +60,12 @@ public class ExecutionEngine {
 
     private static final Logger log = LoggerFactory.getLogger(ExecutionEngine.class);
 
+    /**
+     * 自动回退写进 rollback_record 的操作人标记: 人工回退带的是真实 operator, 两者在补偿历史里分得开
+     * (查得到"这一轮是谁拆的"), 也不必为这个给回退再开一个来源参数。
+     */
+    private static final String AUTO_ROLLBACK_OPERATOR = "auto";
+
     private final ProcessInstMapper processMapper;
     private final ListenerEngine listeners;
     private final ObserverEngine observers;
@@ -69,11 +75,13 @@ public class ExecutionEngine {
     private final VariableResolver resolver;
     private final ConditionEvaluator evaluator;
     private final Materializer materializer;
+    private final RollbackService rollback;
 
     public ExecutionEngine(ProcessInstMapper processMapper,
                            ListenerEngine listeners, ObserverEngine observers, DefinitionCache defCache,
                            ContextFactory ctxFactory, NodeDriver driver,
-                           VariableResolver resolver, ConditionEvaluator evaluator, Materializer materializer) {
+                           VariableResolver resolver, ConditionEvaluator evaluator, Materializer materializer,
+                           RollbackService rollback) {
         this.processMapper = processMapper;
         this.listeners = listeners;
         this.observers = observers;
@@ -83,6 +91,7 @@ public class ExecutionEngine {
         this.resolver = resolver;
         this.evaluator = evaluator;
         this.materializer = materializer;
+        this.rollback = rollback;
     }
 
     // ===================== 流程启动(认领 + 驱动) =====================
@@ -131,10 +140,10 @@ public class ExecutionEngine {
         } catch (Exception e) {
             log.error("流程 before 否决 proc={}", procInstId, e);
             dc.processContext().recordFailure(Errors.describe(e, "流程 before 否决", "process=" + procInstId));
-            return finalizeProcess(dc, procChain, Status.FAILED);
+            return autoRollback(dc, def, finalizeProcess(dc, procChain, Status.FAILED));
         }
 
-        return finalizeProcess(dc, procChain, driveRoots(dc, def));
+        return autoRollback(dc, def, finalizeProcess(dc, procChain, driveRoots(dc, def)));
     }
 
     /**
@@ -240,5 +249,38 @@ public class ExecutionEngine {
         Status actual = readStatus(procInstId);
         log.info("流程收尾时状态被抢先翻走 proc={} 聚合={} 实际={}", procInstId, fin, actual);
         return actual;
+    }
+
+    // ===================== 自动回退(定义级 autoRollback) =====================
+
+    /**
+     * 定义配了顶层 {@code autoRollback: true} 时, 本次驱动的终态是 FAILED/STOPPED 就当场逆序补偿。
+     *
+     * 口径:
+     *  - 判的是**收尾后库上那个状态**({@link #finalizeProcess} 的返回值), 所以人工 stop 抢先翻成 STOPPED
+     *    同样算"停止后回退"; pause 停在 PAUSED 不算——暂停是可恢复的, 不该顺手把副作用拆掉;
+     *  - 排在 setdown(finally) 与流程 after 监听器之后: 监听器看到的终态与库里一致, 回退那对
+     *    RollbackListener 切点随后单独触发;
+     *  - 回退自身的任何异常都不外抛: 终态已经落库, 不能让补偿失败改写调用方拿到的结果; 原因进日志,
+     *    补偿失败本身还会单独落一条 COMPENSATE_FAILED 的 rollback_record;
+     *  - 不改流程终态: action_inst / process_inst 的状态都是执行事实, 撤销历史只留在 rollback_record。
+     *
+     * 定义装载失败那条路(abortClaimed)取不到 autoRollback 声明, 也就无从自动回退——那时流程体还没铺开。
+     */
+    private Status autoRollback(DriveContext dc, ProcessDefinition def, Status fin) {
+        if (def == null || !def.autoRollbackEnabled() || (fin != Status.FAILED && fin != Status.STOPPED)) {
+            return fin;
+        }
+        String procInstId = dc.procInstId();
+        log.info("自动回退触发 proc={} status={}(定义声明 autoRollback)", procInstId, fin);
+        try {
+            RollbackService.RollbackReport report = rollback.rollback(procInstId, AUTO_ROLLBACK_OPERATOR);
+            log.info("自动回退结束 proc={} outcome={} 已补偿={} 不可补偿={} 补偿失败={} 跳过={} 否决={}",
+                    procInstId, report.outcome(), report.compensated.size(), report.blocked.size(),
+                    report.failed.size(), report.skipped.size(), report.veto);
+        } catch (Exception e) {
+            log.error("自动回退异常 proc={}", procInstId, e);
+        }
+        return fin;
     }
 }

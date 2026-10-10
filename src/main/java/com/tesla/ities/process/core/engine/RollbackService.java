@@ -28,10 +28,13 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * 回退/补偿服务(Saga, 向后恢复)。默认人工触发, 不自动。
+ * 回退/补偿服务(Saga, 向后恢复)。人工触发走门面; 定义配了顶层 {@code autoRollback: true} 时
+ * 由 ExecutionEngine 在驱动收尾(终态 FAILED/STOPPED)自动调一次 {@link #rollback} —— 本类不感知是谁调的。
  *
  * 机制: 逆序对"已成功且 handler 可补偿"的 action 调 compensate()。
  * 遇不可补偿步骤 -> 停下、标记 BLOCKED、告警。补偿自身失败 -> COMPENSATE_FAILED, 挂起告警, 不无限重试。
+ * **已成功补偿过的 action 不再重复撤销**(看该 action 最新一条 rollback_record 是否 COMPENSATED):
+ * 原 action 状态是不可变的执行事实, 分不清补没补过, 而补过再补一次(二次删除/二次回滚)通常比漏补更糟。
  *
  * v1.2(#16): 补偿不再改原 action_inst.status(它是不可变的执行事实), 而是**每个补偿步骤单独入
  * rollback_record 一行**, 通过 action_inst_id 关联原实例。状态机: COMPENSATING -> COMPENSATED /
@@ -120,6 +123,14 @@ public class RollbackService {
                 log.warn("回退遇不可补偿步骤 proc={} action={}, 停止告警", procInstId, a.getActionDefId());
                 break;
             }
+            // 已经补成功的不再重复撤销(原 action 状态是不可变的执行事实, 单看它分不清"补过没补过"):
+            // 自动回退(定义配了 autoRollback)会让同一流程的回退不止一次跑到(重试再失败/人工又点一次),
+            // 重复 compensate 一个已撤销的副作用通常比漏补更糟(二次删除/二次回滚别人的资源), 所以这里当场跳过并留数。
+            if (alreadyCompensated(a.getActionInstId())) {
+                report.skipped(a.getActionDefId());
+                log.info("action 已成功补偿过, 本次不重复撤销 proc={} action={}", procInstId, a.getActionDefId());
+                continue;
+            }
 
             // 先落 COMPENSATING 一行(占位), 再执行补偿, 成功后更新为 COMPENSATED / 失败 COMPENSATE_FAILED
             String rid = record(procInstId, a, RollbackStatus.COMPENSATING, operator, detail("compensating", null));
@@ -172,6 +183,15 @@ public class RollbackService {
             processMapper.updateVars(procInstId, Json.write(pctx.vars()), operator);
             pctx.clearVarsDirty();
         }
+    }
+
+    /**
+     * 该 action 的最新一条补偿记录是否已是 COMPENSATED(= 副作用已撤销)。
+     * 只看最新一条: COMPENSATE_FAILED / BLOCKED 都还欠着撤销, 下次回退必须再试一次。
+     */
+    private boolean alreadyCompensated(String actionInstId) {
+        RollbackRecordEntity last = rollbackMapper.findLatestByAction(actionInstId);
+        return last != null && RollbackStatus.COMPENSATED.getStatus().equals(last.getStatus());
     }
 
     /** 写一条 rollback_record, 返回业务键 rollbackId。 */
@@ -246,6 +266,8 @@ public class RollbackService {
         public final List<String> compensated = new ArrayList<>();
         public final List<String> blocked = new ArrayList<>();
         public final List<String> failed = new ArrayList<>();
+        /** 因"上一次已补偿成功"而跳过撤销的 action(不重复撤销, 也不影响 outcome)。 */
+        public final List<String> skipped = new ArrayList<>();
         /** 回退前置监听器否决时的原因; null = 未被否决。 */
         public String veto;
         void compensated(String a) {
@@ -256,6 +278,9 @@ public class RollbackService {
         }
         void failed(String a, String why) {
             failed.add(a + ": " + why);
+        }
+        void skipped(String a) {
+            skipped.add(a);
         }
         void vetoed(String why) {
             veto = why;

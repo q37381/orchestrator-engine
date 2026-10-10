@@ -14,7 +14,7 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * 命名并行容器端到端: flow 里 {@code PARALLEL(标签: a,b)} 的标签指向 nodes 下的一条纯容器声明,
+ * 命名并行容器端到端: flow 里 {@code PARALLEL:标签(a,b)} 的命名后缀指向 nodes 下的一条纯容器声明,
  * 于是并行也拿到"就近声明"的三项容器能力——生效策略、guard、config + 节点级监听器链。
  *
  * 钉的四件事:
@@ -35,7 +35,7 @@ public class EngineNamedParallelTest extends EngineE2ETestBase {
     public void eachNamedParallelCarriesItsOwnPolicy() {
         publish("parPolicy", ""
                 + "errorPolicy: CONTINUE_ON_ERROR\n"                 // 全局: 逐项跑完
-                + "flow: \"PARALLEL(strict: a, b),PARALLEL(c, d)\"\n"
+                + "flow: \"PARALLEL:strict(a, b),PARALLEL(c, d)\"\n"
                 + "nodes:\n"
                 + "  strict:\n    errorPolicy: FAIL_FAST\n"          // 这一条自己覆盖: 遇坏即停
                 + "  a:\n    handler: ok\n  b:\n    handler: ok\n"
@@ -60,7 +60,7 @@ public class EngineNamedParallelTest extends EngineE2ETestBase {
     public void illegalDeclarationFallsBackToGlobal() {
         publish("parTypo", ""
                 + "errorPolicy: CONTINUE_ON_ERROR\n"
-                + "flow: \"PARALLEL(checks: a)\"\n"
+                + "flow: \"PARALLEL:checks(a)\"\n"
                 + "nodes:\n  checks:\n    errorPolicy: contin_on_errr\n  a:\n    handler: ok\n");
         ProcessExecution r = run("parTypo");
         Assert.assertEquals(Status.SUCCESS, r.getStatus());
@@ -74,7 +74,7 @@ public class EngineNamedParallelTest extends EngineE2ETestBase {
     @Test
     public void guardFalseSkipsWholeNamedParallel() {
         publish("parGuard", ""
-                + "flow: \"PARALLEL(checks: a),tail\"\n"
+                + "flow: \"PARALLEL:checks(a),tail\"\n"
                 + "nodes:\n"
                 + "  checks:\n    when: \"${vars.absent} == true\"\n"    // vars.absent 未定义 -> 条件假
                 + "  a:\n    handler: ok\n"
@@ -95,7 +95,7 @@ public class EngineNamedParallelTest extends EngineE2ETestBase {
     public void guardTrueDrivesChildren() {
         publish("parGuardOn", ""
                 + "vars:\n  runChecks: true\n"
-                + "flow: \"PARALLEL(checks: a)\"\n"
+                + "flow: \"PARALLEL:checks(a)\"\n"
                 + "nodes:\n"
                 + "  checks:\n    when: \"${vars.runChecks} == true\"\n"
                 + "  a:\n    handler: ok\n");
@@ -111,7 +111,7 @@ public class EngineNamedParallelTest extends EngineE2ETestBase {
     @SuppressWarnings("unchecked")
     public void containerConfigReadableByChildren() {
         publish("parCfg", ""
-                + "flow: \"PARALLEL(checks: probe)\"\n"
+                + "flow: \"PARALLEL:checks(probe)\"\n"
                 + "nodes:\n"
                 + "  checks:\n    config:\n      threshold: 5\n"
                 + "  probe:\n"
@@ -132,7 +132,7 @@ public class EngineNamedParallelTest extends EngineE2ETestBase {
     @Test
     public void containerNodeListenerChainFires() {
         publish("parListener", ""
-                + "flow: \"PARALLEL(checks: a)\"\n"
+                + "flow: \"PARALLEL:checks(a)\"\n"
                 + "nodes:\n"
                 + "  checks:\n    listeners:\n      - name: nRecord\n"
                 + "  a:\n    handler: ok\n");
@@ -149,7 +149,7 @@ public class EngineNamedParallelTest extends EngineE2ETestBase {
     public void progressGroupsOneRowPerNamedContainer() {
         publish("parProg", ""
                 + "materialization: EAGER\n"
-                + "flow: \"PARALLEL(checks: a, b),PARALLEL(c, d)\"\n"
+                + "flow: \"PARALLEL:checks(a, b),PARALLEL(c, d)\"\n"
                 + "nodes:\n"
                 + "  checks:\n    name: 校验清单\n    errorPolicy: CONTINUE_ON_ERROR\n"
                 + "  a:\n    handler: ok\n  b:\n    handler: ok\n  c:\n    handler: ok\n  d:\n    handler: ok\n");

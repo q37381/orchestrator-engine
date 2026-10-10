@@ -19,7 +19,7 @@
 #    不需要 action 级分片过滤(引擎也没有这个字段)。
 #
 # 装载期展开(DefinitionLoader.expandGroups): 本文件的 flow 会被重写成
-#   PARALLEL(GROUP(spaceCheck,spaceCheck.fetchSource,spaceCheck.diffPerShard),GROUP(rowCountCheck,...))
+#   PARALLEL(GROUP:spaceCheck(spaceCheck.fetchSource,spaceCheck.diffPerShard),GROUP:rowCountCheck(...))
 # 且 group.nodes 下的子节点被提升进顶层 nodes(键 = "<组>.<子>")。两者都是可序列化字段,
 # 所以定义 JSON 快照自带展开结果——缓存借出的副本重解析 flow 也是同一棵树。
 

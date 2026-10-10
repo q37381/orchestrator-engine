@@ -25,7 +25,7 @@ import java.util.Map;
  * 两个视图:
  *  - 扁平口径(total/done/percent/counts/items): 全流程所有已物化 action 行, items 带 nodeInstId/nodeName 与
  *    action/actionName 便于展示归组;
- *  - **groups**: 每个**命名容器**一项(GROUP 聚合节点 + 带冒号标签的并行 {@code PARALLEL(标签: a,b)}) ——
+ *  - **groups**: 每个**命名容器**一项(GROUP 聚合节点 + 带命名后缀的并行 {@code PARALLEL:标签(a,b)}) ——
  *    一个校验项一行(标题/状态/自己的 total·done·percent + 明细), 判据是行的 **node_def_id 列**非空(命名容器才落)
  *    而非 type 逐个硬编码; 标题取 name(展示名) > node_def_id(定义 id) > nodeInstId(直接读列, 不再解 config)。
  */

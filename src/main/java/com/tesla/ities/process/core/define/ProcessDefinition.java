@@ -198,6 +198,31 @@ public class ProcessDefinition {
     }
 
     /**
+     * 布尔开关声明值的宽松文本解析: 只认 true / false(大小写不敏感、忽略首尾空白), 其余一律 null。
+     * null 有两种来历, 由调用方区分: 装载期 = 非法声明(拒), 判定期 = 没声明(按关闭算)。
+     * YAML 侧不需要额外兼容: {@code yes}/{@code on} 这类标量已被 SnakeYAML 解成 Boolean, 转字符串就是 true。
+     */
+    static Boolean parseSwitch(String v) {
+        if (v == null) {
+            return null;
+        }
+        String t = v.trim();
+        if ("true".equalsIgnoreCase(t)) {
+            return Boolean.TRUE;
+        }
+        return "false".equalsIgnoreCase(t) ? Boolean.FALSE : null;
+    }
+
+    /**
+     * 本流程是否配了自动回退(派生视图, 非属性): 声明值算出 true 才算开。
+     * 生效点在 ExecutionEngine 收尾——驱动终态为 FAILED/STOPPED 时当场逆序补偿。
+     */
+    @JsonIgnore
+    public boolean autoRollbackEnabled() {
+        return Boolean.TRUE.equals(parseSwitch(autoRollback));
+    }
+
+    /**
      * 是否 EAGER 物化(派生视图, 非属性)。
      * 本类会被序列化成定义快照再读回(DefinitionCache 借出副本), 所以所有**派生方法一律 @JsonIgnore**——
      * Jackson 按 bean 约定把 isXxx/getXxx 当属性写出去, 而回读时没有对应 setter 会直接失配抛异常。
