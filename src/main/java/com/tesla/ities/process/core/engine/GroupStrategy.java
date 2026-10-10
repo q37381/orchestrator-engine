@@ -28,6 +28,9 @@ import java.util.List;
  *     process_node_inst.result, 所以显式放置的值崩溃重驱动后仍在。
  *
  * 不支持: GROUP 自己带 shard(语义会变成"每 lane 跑一遍整个子流程", 与 lane 容器冲突); 分片永远在叶子子节点上。
+ *
+ * 组内序列的**收敛口径**只看组行自己的生效值(组声明 > 流程级全局 > 默认 FAIL_FAST), 组内子节点的声明只作用于
+ * 它自己容器内。**组外**(根序列)遇这条组坏要不要继续, 由上一层序列按就近声明判定(见 ProcessDefinition.stopsSequence)。
  */
 @Component
 public class GroupStrategy implements NodeStrategy {
@@ -72,7 +75,7 @@ public class GroupStrategy implements NodeStrategy {
             // 显式挂进组桶的 result 才对子节点可读(引擎不自动向组桶写值)
             agg = Status.aggregate(agg, driver.driveNode(dc, child, ctx));
             if ((agg == Status.FAILED || agg == Status.STOPPED) && failFast) {
-                break;   // 组内 FAIL_FAST: 跳过剩余子节点(组外是否继续由上一层容器的策略决定)
+                break;   // 组内 FAIL_FAST: 跳过剩余子节点(组外是否继续由上一层序列按就近声明判)
             }
         }
         return agg;

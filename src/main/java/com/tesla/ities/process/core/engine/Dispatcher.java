@@ -32,8 +32,8 @@ public class Dispatcher implements SmartInitializingSingleton {
     private final long pollIntervalMs;
     private final int claimBatch;
 
-    // 分布式路由能力: unit/zone 皆空 = 全局模式(捞全部 pending, 不看调度表, 保留单机/存量行为);
-    // 配了才走路由模式(只主动认领调度表里命中本能力的流程)。一台节点只对应一个 unit + 一个 zone。
+    // 分布式路由能力: unit 空 = 全局模式(捞全部 pending, 不看调度表, 保留单机/存量行为);
+    // 配了 unit 才走路由模式(只主动认领调度表里命中本能力的流程)。zone 可选: 不配则不按区域收窄。
     private final String unit;
     private final String zone;
 
@@ -60,9 +60,9 @@ public class Dispatcher implements SmartInitializingSingleton {
         this.zone = zone;
     }
 
-    /** 是否路由模式: 配了 unit 且配了 zone 才按能力过滤, 否则全局认领。 */
+    /** 是否路由模式: 配了 unit 就按能力过滤(zone 可选, 不配则不按区域收窄); 否则全局认领。 */
     private boolean routed() {
-        return unit != null && !unit.isEmpty() && zone != null && !zone.isEmpty();
+        return unit != null && !unit.isEmpty();
     }
 
     // ========== 生命周期 ==========

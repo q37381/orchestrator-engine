@@ -94,15 +94,16 @@ CREATE TABLE process_inst (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- 调度表(可选路由, 独立维护): 只有在本表有行的流程才参与"主动调度"(调度器按能力认领)。
---   创建流程时路由是可选的: 给了 (sched_unit, sched_zone) 才写这里一行 -> 进主动调度池;
---   没给就没有本表行 -> 调度器不主动认领(仍可同步 facade.start 触发)。
+--   创建流程时路由是可选的: 给了 sched_unit 才写这里一行 -> 进主动调度池;
+--   没给 unit 就不写本表 -> 调度器不主动认领(仍可同步 facade.start 触发)。
+--   sched_zone 可选(NULL = 不钉网络区域, 同单元任意 zone 的 worker 都可认领; 非 NULL = 只该区域的 worker 认领)。
 --   status/认领闸门仍在 process_inst(单行 CAS 保原子), 本表只承载路由维度; 认领命中靠 JOIN 本表收窄。
 --   sched_unit/sched_zone 是**过滤维度**(走索引)故独立成列; 后期若要机器id/节点id 等元数据另议扩展。
 CREATE TABLE process_sched (
   auto_id       BIGINT      NOT NULL AUTO_INCREMENT COMMENT '物理主键, 应用不直接使用',
   proc_inst_id  VARCHAR(32) NOT NULL COMMENT '流程业务键, 一对一关联 process_inst',
-  sched_unit    VARCHAR(64) NOT NULL COMMENT '服务单元(路由过滤维度)',
-  sched_zone    VARCHAR(64) NOT NULL COMMENT '网络区域(路由过滤维度)',
+  sched_unit    VARCHAR(64) NOT NULL COMMENT '服务单元(路由过滤维度, 必填)',
+  sched_zone    VARCHAR(64) COMMENT '网络区域(路由过滤维度, 可选: NULL=不钉区域)',
   creator_id    VARCHAR(20) COMMENT '创建用户',
   updator_id    VARCHAR(20) COMMENT '最后更新用户',
   created_at    DATETIME    NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -190,7 +191,7 @@ CREATE TABLE process_rollback_record (
   proc_inst_id   VARCHAR(32) NOT NULL COMMENT '所属流程业务键',
   action_inst_id VARCHAR(32) NOT NULL COMMENT '关联的原 action 业务键',
   action_def_id  VARCHAR(128),
-  status         VARCHAR(24)  NOT NULL COMMENT 'RollbackStatus.getStatus() 小写: compensating|compensated|compensate_failed|blocked',
+  status         VARCHAR(24)  NOT NULL COMMENT 'RollbackStatus.getStatus() 小写: compensating|compensated|compensate_failed|blocked|restoring|restored|restore_failed',
   operator       VARCHAR(64),
   detail         MEDIUMTEXT  COMMENT 'JSON 文本: reason/异常信息等',
   creator_id     VARCHAR(20) COMMENT '创建用户',

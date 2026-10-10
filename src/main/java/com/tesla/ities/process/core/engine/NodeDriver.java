@@ -67,6 +67,8 @@ import java.util.concurrent.Future;
  * 失败/跳过信息写入 action result 的保留键
  * __error/__skipReason(不再用独立列); 落这些保留键时**先并入原有 result**, 不丢失已持久化的业务结果。
  * config 经两档解析后仍残留的占位符写进保留键 __unresolved(仅告警, 不阻断执行)。
+ * 重入(干预复位后重跑)则相反: 执行前先把上一轮的 __error/__skipReason/__unresolved 摘掉, 本轮该记的再由对应
+ * 分支重新落 —— 跑成功的行不该还挂着上一轮失败时的痕迹(进度视图直接读这几个键, 与流程级 settleFailure 同口径)。
  *
  * 失败摘要不再只打在日志里: 节点级 catch(before 否决 / 策略抛错)与 action 级 catch 都用
  * {@link Errors#describe} 收成一句"语境(定位): 类名: 消息"写进本行的 __error, 并 recordFailure
@@ -174,12 +176,15 @@ public class NodeDriver {
     /**
      * 节点收尾: 落状态 + result(带失败摘要时并入保留键 __error, 先并入原有 result 不丢业务数据) + 发 after。
      * 有摘要的同时把它 {@code recordFailure} 上报流程级那一条失败记录(由 ExecutionEngine 收尾落库)。
+     * 本轮没失败(error=null)则摘掉行上上一轮的 __error 残留——重入跑成功不该还挂着失败信息(与流程级同口径)。
      */
     private Status finishNode(DriveContext dc, NodeContext ctx, List<ListenerDef> nodeChain, Status s, String error) {
         Map<String, Object> res = new LinkedHashMap<>(ctx.result());
         if (error != null) {
             res.put(Errors.KEY, error);
             dc.processContext().recordFailure(error);
+        } else {
+            res.remove(Errors.KEY);
         }
         nodeMapper.updateStatusResult(ctx.nodeInstId(), s.getStatus(), Json.write(res), ctx.userId());
         listeners.nodeAfter(nodeChain, ctx, s);   // 纯通知
@@ -332,6 +337,11 @@ public class NodeDriver {
         if (cancellation.isCancelled(procInstId)) {
             actx.cancel();
         }
+        // 重入(干预复位后重跑)先把上一轮留下的痕迹从本行桶里摘干净: 与流程级 settleFailure 同口径,
+        // "重跑成功后不该还挂着失败信息"。本轮该记的 __error/__skipReason/__unresolved 由后续各分支重新写。
+        actx.result().remove(Errors.KEY);
+        actx.result().remove("__skipReason");
+        actx.result().remove("__unresolved");
 
         Map<String, Object> rawCfg = Json.readMap(action.getConfig());
         // 链 = 全局 action 级链 + action 自己声明的链合并(全局在前); 分片时每 lane 的每个 action 都走

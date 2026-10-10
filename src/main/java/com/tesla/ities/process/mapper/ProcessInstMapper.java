@@ -40,7 +40,8 @@ public interface ProcessInstMapper {
 
     /**
      * 路由认领(#分布式调度): 只捞"调度表里有行且命中本 worker 能力"的 PENDING 流程。
-     * JOIN process_sched 收窄到 sched_unit = unit 且 sched_zone = zone; 无调度行的流程不会被主动调度。
+     * JOIN process_sched 收窄到 sched_unit = unit; zone 可选——流程钉了 sched_zone 才要求等于 worker.zone,
+     * 流程 sched_zone 为 NULL(未区分区域, 如测试环境)则同单元任意 worker 都认领。无调度行的流程不会被主动调度。
      * 认领闸门仍是 process_inst.status='pending'(单行 CAS 保原子), 本方法只多一层路由过滤。
      */
     List<String> findClaimableIdsByRoute(@Param("unit") String unit,

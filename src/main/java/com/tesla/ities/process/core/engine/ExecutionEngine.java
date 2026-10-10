@@ -27,8 +27,9 @@ import java.util.Map;
  *   流程级 ProcessListener.before -> **按定义顺序前向走查**根节点 -> 收尾 finalizeProcess(+ ProcessListener.after)。
  *
  * 顶层走查 = setup(前置) -> flow(主流程, 扁平化的顶层表达式) -> setdown(收尾, finally 语义):
- *  - setup/flow 按声明顺序逐个驱动, fail-fast 与否看**流程级全局 errorPolicy**(未声明 = FAIL_FAST):
- *    遇 FAILED/STOPPED 不再启动后续根, 配 CONTINUE_ON_ERROR 则跑完剩余根再聚合;
+ *  - setup/flow 按声明顺序逐个驱动, 遇坏是否继续走**就近声明优先**(见 ProcessDefinition.stopsSequence):
+ *    该根自己声明了 errorPolicy 就听它的(FAIL_FAST 即停后续根 / CONTINUE_ON_ERROR 跑完剩余根),
+ *    没声明才回落**流程级全局 errorPolicy**(也没声明 = FAIL_FAST);
  *  - setdown **无论成败都执行**(清理锁/上报), 其结果也参与终态聚合(FAILED > STOPPED > SUCCESS)。
  *  - 实例行与有序根表达式按下标对齐(表达式作为走查光标补充进行内, 不落库):
  *    已执行过的行由 NodeDriver 幂等跳过; 缺行按 LAZY/EAGER 补物化——
@@ -186,14 +187,15 @@ public class ExecutionEngine {
 
     /**
      * 顶层走查: setup(前置) + flow(主流程) + setdown(收尾 finally)。
-     * 行与 orderedRoots 按下标对齐; setup/flow 段按**全局 errorPolicy** 决定遇坏是否跳过剩余, setdown 段始终执行。
+     * 行与 orderedRoots 按下标对齐; setup/flow 段遇坏是否跳过剩余 = **就近声明优先**
+     * (那一项自己声明了 errorPolicy 就听它的, 没声明才回落流程级全局), setdown 段始终执行。
      * LAZY 下走查到第 i 个才物化第 i 个根(rootAt); EAGER 下节点行创建期已建全, rootAt 只定位对齐。
      */
     private Status driveRoots(DriveContext dc, ProcessDefinition def) {
         List<DslParser.Expr> ordered = def.orderedRoots();
         boolean eager = def.isEager();
-        // 根序列属于流程这一层容器: 看全局 errorPolicy(节点级声明只管自己容器内的 action/lane/子节点)
-        boolean failFast = def.globalErrorPolicy() == ErrorPolicy.FAIL_FAST;
+        // 根序列属于流程这一层容器: 回落口径是全局 errorPolicy, 但根自己写了声明就就近优先(仅此层跨层看声明)
+        ErrorPolicy layer = def.globalErrorPolicy();
         int flowStart = def.setupSize();                              // setup 段 [0, flowStart)
         int flowEnd = flowStart + def.roots().size();                 // flow 段 [flowStart, flowEnd)
         Status s = Status.SUCCESS;
@@ -201,9 +203,12 @@ public class ExecutionEngine {
         try {
             for (int i = 0; i < ordered.size(); i++) {
                 NodeInstEntity root = materializer.rootAt(dc, ordered, i, eager);
-                s = Status.aggregate(s, driver.driveNode(dc, root));
-                if (failFast && i < flowEnd && (s == Status.FAILED || s == Status.STOPPED)) {
-                    i = flowEnd - 1;   // FAIL_FAST: 跳过 setup/flow 剩余(循环自增后从 setdown 段继续)
+                // 只按**本根**这一条判收敛: 聚合值会带着更早那次的坏, 用它判会把没吭声的后续根一起误杀
+                Status one = driver.driveNode(dc, root);
+                s = Status.aggregate(s, one);
+                if (i < flowEnd && (one == Status.FAILED || one == Status.STOPPED)
+                        && def.stopsSequence(root.getDef(), layer)) {
+                    i = flowEnd - 1;   // 收敛: 跳过 setup/flow 剩余(循环自增后从 setdown 段继续)
                 }
             }
         } catch (Exception e) {

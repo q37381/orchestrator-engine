@@ -91,8 +91,9 @@ public class PlanService {
     }
 
     /**
-     * 创建流程实例 + **可选路由**(分布式调度): 给了 schedUnit/schedZone 才往调度表写一行 -> 该流程进"主动调度池";
-     * 不给(任一为空)就不写 -> 调度器不主动认领它(仍可同步 {@code facade.start} 触发)。
+     * 创建流程实例 + **可选路由**(分布式调度): 给了 schedUnit 才往调度表写一行 -> 该流程进"主动调度池";
+     * 没给 schedUnit 就不写 -> 调度器不主动认领它(仍可同步 {@code facade.start} 触发)。
+     * schedZone 可选: 测试环境常不区分区域, 留空(NULL)则同单元任意 worker 都能认领; 生产环境钉了区域才要求同区域 worker。
      *
      * <p>两行写入(process_inst + process_sched)非同一事务(引擎不托管事务, 由消费者按需在外部包裹):
      * 先插 process_inst 再插 process_sched, 若调度行写失败, 最坏是该流程留在 pending 但未被主动调度
@@ -139,12 +140,12 @@ public class PlanService {
         inst.setUpdatorId(userId);
         processMapper.insert(inst);
 
-        // 可选路由: 两者都给了才写调度行(进主动调度池); 缺任一 = 不主动调度。
-        if (schedMapper != null && hasText(schedUnit) && hasText(schedZone)) {
+        // 可选路由: 给了 schedUnit 才写调度行(进主动调度池); sched_zone 可选(测试环境常不区分, NULL=不钉区域)。
+        if (schedMapper != null && hasText(schedUnit)) {
             ProcessSchedEntity sched = new ProcessSchedEntity();
             sched.setProcInstId(procInstId);
             sched.setSchedUnit(schedUnit);
-            sched.setSchedZone(schedZone);
+            sched.setSchedZone(hasText(schedZone) ? schedZone : null);
             sched.setCreatorId(userId);
             sched.setUpdatorId(userId);
             schedMapper.insert(sched);

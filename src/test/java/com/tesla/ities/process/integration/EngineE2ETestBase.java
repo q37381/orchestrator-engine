@@ -151,7 +151,7 @@ public abstract class EngineE2ETestBase {
 
         ActionHandlerRegistry handlers = new ActionHandlerRegistry(Arrays.asList(
                 ok(), thrower(), skipper(), nuller(), varWriter(), flagTrue(), echoConfig(), placeToGroup(),
-                compOk(), compDefault(), compFail(), nonComp(), dbMigrate(), stopper()));
+                compOk(), compDefault(), compFail(), nonComp(), dbMigrate(), stopper(), flaky()));
         ShardResolverRegistry shardResolvers = new ShardResolverRegistry(
                 Collections.singletonList(dbTopology()));
         ProcessListenerRegistry processListeners = new ProcessListenerRegistry(
@@ -462,6 +462,22 @@ public abstract class EngineE2ETestBase {
         });
         when(h.compensable()).thenReturn(true);
         return h;
+    }
+
+    /**
+     * 头一次失败、之后成功: 给"重试后跑通"的用例用(每个用例一套新装配, 计数因此天然独立)。
+     * 顺带验证重跑会把上一轮的 __error 痕迹摘干净。
+     */
+    private ActionHandler flaky() throws Exception {
+        AtomicInteger attempts = new AtomicInteger();
+        return handler("flaky", ctx -> {
+            ctx.putResult("rows", 1);
+            rec.order.add("handler:flaky:" + ctx.actionDefId());
+            if (attempts.getAndIncrement() == 0) {
+                throw new IllegalStateException("handler flaky boom");
+            }
+            return Status.SUCCESS;
+        });
     }
 
     /**

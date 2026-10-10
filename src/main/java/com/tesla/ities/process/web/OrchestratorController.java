@@ -65,6 +65,13 @@ public class OrchestratorController {
         return ResponseEntity.ok(facade.doRollback(id, operator));
     }
 
+    /** 重试整个流程(以流程实例发起): 复位所有没跑成的行并重新入队, 重入即从断点续跑。 */
+    @PostMapping("/processes/{id}/retry")
+    public Map<String, Object> retry(@PathVariable String id,
+                                     @RequestParam(defaultValue = "system") String operator) {
+        return ok("retried", facade.retry(id, operator));
+    }
+
     @PostMapping("/actions/{actionInstId}/retry")
     public Map<String, Object> retryAction(@PathVariable String actionInstId,
                                            @RequestParam(defaultValue = "system") String operator) {

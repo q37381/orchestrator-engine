@@ -30,6 +30,9 @@ import java.util.concurrent.Future;
  * FAIL_FAST(默认) = drain: 不取消已在跑的兄弟(无法安全中断), 取消尚未开始的排队任务, 等全部 join 完再聚合失败;
  *   仅靠 isCancelled 钩子让业务自愿收敛。CONTINUE_ON_ERROR: 跑完聚合。
  * 终态按 severity 优先级聚合(Status.aggregate): FAILED > STOPPED > SUCCESS。
+ * **本行策略还决定上层要不要跟着停**: 命名容器({@code PARALLEL:checks(a,b)})的声明就是它的生效值,
+ *   顶层根序列/GROUP 组内序列据此判"这一项坏了叫停还是放行"(见 ProcessDefinition.stopsSequence)——
+ *   匿名并行无声明, 恒回落上一层的口径。
  */
 @Component
 public class ParallelStrategy implements NodeStrategy {

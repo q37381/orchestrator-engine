@@ -68,8 +68,9 @@ public class ProcessFacade {
     }
 
     /**
-     * 创建流程实例 + **可选路由**(分布式调度): 给了 schedUnit/schedZone 才写调度行 -> 参与主动调度;
-     * 任一为空则不写 -> 调度器不主动认领(仍可 {@link #start(String)} 同步触发)。老的四参调用等价于不路由。
+     * 创建流程实例 + **可选路由**(分布式调度): 给了 schedUnit 才写调度行 -> 参与主动调度;
+     * schedZone 可选(测试环境常不区分区域, 留空则同单元任意 worker 认领)。没给 schedUnit 则不写 -> 调度器不主动认领
+     * (仍可 {@link #start(String)} 同步触发)。老的四参调用等价于不路由。
      */
     public String create(String defId, Integer version, Map<String, Object> params, String userId,
                          String schedUnit, String schedZone) {
@@ -121,6 +122,18 @@ public class ProcessFacade {
         return intervention.stop(procInstId, operator);
     }
 
+    /**
+     * 重试整个流程(向前恢复, **以流程实例 id 发起**): 把流程里所有"本轮没跑成"的行(失败/停止/卡在途中的
+     * action 与节点)复位成 CREATED 并重新入队, 重入时已完成项幂等跳过 —— 即"从断点续跑到结尾"。
+     * 已 SUCCESS/SKIPPED 的流程无项可复位也翻不动闸门, 返 false(重试不把跑成功的流程再跑一遍); 依赖 handler 幂等。
+     * 若这一流程之前回退过(定义 autoRollback 或点过 {@link #doRollback}), 重新驱动前引擎会先把被撤销的
+     * 副作用按执行顺序**重放**回来(见 RestoreService), 现场修好后照常重试即可。
+     */
+    public boolean retry(String procInstId, String operator) {
+        return intervention.retryProcess(procInstId, operator);
+    }
+
+    /** 定点重跑某一条 action(细粒度入口; 整轮重试请用 {@link #retry(String, String)})。 */
     public boolean retryAction(String actionInstId, String operator) {
         return intervention.retryAction(actionInstId, operator);
     }
@@ -136,6 +149,8 @@ public class ProcessFacade {
      * 执行回退(逆序补偿), 返回报告。
      * 定义配了顶层 {@code autoRollback: true} 时引擎会在驱动终态 FAILED/STOPPED 后自动补一轮(补偿记录 operator=auto),
      * 那时这里再调一次通常只是空转: 已成功补偿的 action 不会被重复撤销。
+     * 撤销不是终点: 之后 {@link #retry} 重新驱动之前, 引擎会按执行顺序把被撤销的副作用**重放**回去
+     * (rollback_record 里一条 compensated 后面跟着一条 restored, 原 action 行始终不动)。
      */
     public RollbackService.RollbackReport doRollback(String procInstId, String operator) {
         return rollback.rollback(procInstId, operator);

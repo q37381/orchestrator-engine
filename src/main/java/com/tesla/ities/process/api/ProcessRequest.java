@@ -65,8 +65,9 @@ public final class ProcessRequest {
     }
 
     /**
-     * 可选路由(分布式调度): 指定本流程要落到的服务单元 + 网络区域。
-     * 调了才写调度行 -> 参与调度器主动认领; 不调(或任一为 null)则不路由, 只能同步 {@link #start()} 触发。
+     * 可选路由(分布式调度): 指定本流程要落到的服务单元(+ 可选网络区域)。
+     * 给了 schedUnit 才写调度行 -> 参与调度器主动认领; zone 可留空(测试环境常不区分区域)。
+     * 不调(或 schedUnit 为 null)则不路由, 只能同步 {@link #start()} 触发。
      */
     public ProcessRequest on(String schedUnit, String schedZone) {
         this.schedUnit = schedUnit;
@@ -90,17 +91,22 @@ public final class ProcessRequest {
 
     /** 只创建不执行(流程 PENDING, 由调度器/后续 {@code facade.start(id)} 接手), 返 procInstId。 */
     public String create() {
-        // 未设路由 -> 走原四参门面对口(与不走糖时一字不差); 设了才走带路由的重载。
-        return schedUnit == null && schedZone == null
-                ? facade.create(defId, version, snapshot(), userId)
-                : facade.create(defId, version, snapshot(), userId, schedUnit, schedZone);
+        // 未设路由(无 unit) -> 走原四参门面对口(与不走糖时一字不差); 设了 unit 才走带路由的重载。
+        return routed()
+                ? facade.create(defId, version, snapshot(), userId, schedUnit, schedZone)
+                : facade.create(defId, version, snapshot(), userId);
     }
 
     /** 创建并立即启动(全自动执行主入口), 返流程实例 id + 调用结束时的状态。 */
     public ProcessExecution start() {
-        return schedUnit == null && schedZone == null
-                ? facade.createAndStart(defId, version, snapshot(), userId)
-                : facade.createAndStart(defId, version, snapshot(), userId, schedUnit, schedZone);
+        return routed()
+                ? facade.createAndStart(defId, version, snapshot(), userId, schedUnit, schedZone)
+                : facade.createAndStart(defId, version, snapshot(), userId);
+    }
+
+    /** 是否要路由: 以 unit 为准(zone 可选, 单独给 zone 无意义)。 */
+    private boolean routed() {
+        return schedUnit != null && !schedUnit.trim().isEmpty();
     }
 
     public String getDefId() {

@@ -25,7 +25,8 @@ import java.util.List;
  *  - 叶子行: LeafExprMaterializer 落**生效值**——节点自己声明优先, 未声明才用全局, 都没声明才是 FAIL_FAST;
  *  - 控制行(PARALLEL/IF): 无 NodeDef 可就近声明, 直接取全局(旧实现恒 FAIL_FAST, 全局策略一改就生效);
  *  - lane 行: 继承所属节点行的生效值, 所以全局策略天然覆盖分片;
- *  - 根序列: ExecutionEngine.driveRoots 的 fail-fast 也读全局(单值覆盖, 不像监听器链那样拼接)。
+ *  - 根序列: ExecutionEngine.driveRoots 的收敛**就近声明优先**(见 sequenceConvergencePrefersNearestDeclaration),
+ *    这一项自己声明了 errorPolicy 就听它的, 没声明才回落全局(单值覆盖, 不像监听器链那样拼接)。
  */
 public class GlobalErrorPolicyTest {
 
@@ -131,6 +132,39 @@ public class GlobalErrorPolicyTest {
         Assert.assertEquals("只建了 lane 行", 1, sink.size());
         Assert.assertSame(lane, sink.get(0));
         Assert.assertEquals(ErrorPolicy.CONTINUE_ON_ERROR.getStatus(), lane.getErrorPolicy());
+    }
+
+    /**
+     * 序列收敛口径(stopsSequence): **就近声明优先**, 与本层生效值(effectiveErrorPolicy)是两条独立口径。
+     * 项自己声明了就听它的, 没声明/声明不合法/无定义(匿名 PARALLEL/IF)才回落本层。
+     */
+    @Test
+    public void sequenceConvergencePrefersNearestDeclaration() {
+        ProcessDefinition loose = new DefinitionLoader().load(""
+                + "flow: \"stops,silent,inherit\"\nerrorPolicy: CONTINUE_ON_ERROR\n"
+                + "nodes:\n  stops:\n    handler: h\n    errorPolicy: FAIL_FAST\n"
+                + "  silent:\n    handler: h\n    errorPolicy: bogus\n"
+                + "  inherit:\n    handler: h\n");
+        ErrorPolicy layer = loose.globalErrorPolicy();
+        Assert.assertTrue("声明了 FAIL_FAST -> 要求上层序列停下",
+                loose.stopsSequence(loose.node("stops"), layer));
+        Assert.assertFalse("声明值非法 = 没吭声, 回落本层",
+                loose.stopsSequence(loose.node("silent"), layer));
+        Assert.assertFalse("什么都没声明 = 回落本层",
+                loose.stopsSequence(loose.node("inherit"), layer));
+        Assert.assertFalse("无定义(匿名 PARALLEL/IF)恒回落本层",
+                loose.stopsSequence(null, ErrorPolicy.CONTINUE_ON_ERROR));
+        Assert.assertTrue("本层是 FAIL_FAST 时, 没吭声的项同样即停",
+                loose.stopsSequence(null, ErrorPolicy.FAIL_FAST));
+
+        // 反方向: 全局 FAIL_FAST(默认)里把某一项标成 CONTINUE_ON_ERROR = 它失败也不拦后面
+        ProcessDefinition strict = new DefinitionLoader().load("flow: \"a\"\nnodes:\n  a:\n    handler: h\n    errorPolicy: CONTINUE_ON_ERROR\n");
+        Assert.assertFalse(strict.stopsSequence(strict.node("a"), strict.globalErrorPolicy()));
+        // declaredErrorPolicy 只认"这一项自己说了什么": 无定义/没声明/声明不合法一律 null, 不吃全局也不兜默认
+        Assert.assertNull(strict.declaredErrorPolicy(strict.node("nonexistent")));
+        Assert.assertEquals(ErrorPolicy.CONTINUE_ON_ERROR, strict.declaredErrorPolicy(strict.node("a")));
+        Assert.assertNull("非法声明不当成声明", loose.declaredErrorPolicy(loose.node("silent")));
+        Assert.assertNull("什么都没写不算声明", loose.declaredErrorPolicy(loose.node("inherit")));
     }
 
     /** 定义侧口径: 全局声明值大小写不敏感, 非法/未声明回落 FAIL_FAST; 节点声明优先。 */

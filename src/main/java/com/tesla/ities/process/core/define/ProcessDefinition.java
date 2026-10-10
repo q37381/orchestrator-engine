@@ -29,6 +29,8 @@ import java.util.Map;
  *  - errorPolicy = **全局**错误策略: 声明一次, 没自己声明 errorPolicy 的节点(含匿名 PARALLEL/IF 控制节点与其 lane)
  *    都用它; 与监听器链不同, 单值取**覆盖**语义(节点自己的声明优先), 都没声明才是默认 FAIL_FAST。
  *    另外它也管顶层根序列(setup/flow 遇坏是否继续)——那一层容器就是流程本身。
+ *    但根序列/GROUP 组内序列的收敛是**就近声明优先**(见 {@link #stopsSequence}): 那一项自己写了 errorPolicy
+ *    就听它的(FAIL_FAST 要求上层停下 / CONTINUE_ON_ERROR 失败也不拦后面), 没写才回落到本层。
  *    要只改**某一条**并行的收敛: flow 里给它挂命名后缀 {@code PARALLEL:checks(a,b)}, 在 nodes.checks 上就近声明。
  *  - autoRollback = **自动回退**开关(与 errorPolicy 同为流程级单值声明): 配成 true 后, 本次驱动的终态若是
  *    FAILED 或 STOPPED, 引擎收尾就当场逆序补偿"已成功且可补偿"的 action(等价于自动调一次 RollbackService)。
@@ -195,6 +197,28 @@ public class ProcessDefinition {
     public ErrorPolicy effectiveErrorPolicy(String declared) {
         ErrorPolicy own = ErrorPolicy.parseOrNull(declared);
         return own != null ? own : globalErrorPolicy();
+    }
+
+    /** 节点**自己**声明的错误策略; 没声明/声明不合法/无定义(匿名 PARALLEL/IF)一律 null = "这一项没吭声"。 */
+    public ErrorPolicy declaredErrorPolicy(NodeDef item) {
+        return item == null ? null : ErrorPolicy.parseOrNull(item.getErrorPolicy());
+    }
+
+    /**
+     * 一项遇坏后,**顶层根序列**(setup/flow)要不要就地收敛(跳过剩余根)——**就近声明优先**:
+     *  1. 这一项自己声明了 errorPolicy 就听它的: {@code FAIL_FAST} = "我坏了根序列就停", {@code CONTINUE_ON_ERROR} = "我失败也别拦后续根";
+     *  2. 没声明(或声明不合法/无定义)才回落本层策略 {@code ownerPolicy}——根序列那层就是流程级全局 errorPolicy。
+     *
+     * 于是两项流程级声明盖不住的能力就近表达了: 全局 {@code CONTINUE_ON_ERROR} 里可以指出**关键项**失败即停,
+     * 全局 {@code FAIL_FAST} 里也可以把**锦上添花的校验项**标成失败不拦路。匿名 PARALLEL/IF 无 NodeDef, 恒回落全局。
+     *
+     * 本方法**只作用于根序列这一层**: 容器内部(组内子项/并行扇出/叶子 action)的收敛一律只看容器自己那一条
+     * errorPolicy, 子项声明不跨越本层(见 GroupStrategy/ParallelStrategy)。
+     */
+    @JsonIgnore
+    public boolean stopsSequence(NodeDef item, ErrorPolicy ownerPolicy) {
+        ErrorPolicy declared = declaredErrorPolicy(item);
+        return (declared != null ? declared : ownerPolicy) == ErrorPolicy.FAIL_FAST;
     }
 
     /**

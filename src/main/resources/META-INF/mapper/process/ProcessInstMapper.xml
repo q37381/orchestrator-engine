@@ -63,15 +63,17 @@
         LIMIT #{limit}
     </select>
 
-    <!-- 路由认领: JOIN 调度表收窄到本 worker 能力(unit + zone); 闸门仍读 process_inst.status='pending'。
-         只调度"调度表里有行"的流程; 无调度行的流程不会被主动认领(仍可同步 start)。 -->
+    <!-- 路由认领: JOIN 调度表收窄到本 worker 能力(unit 必配, zone 可选); 闸门仍读 process_inst.status='pending'。
+         只调度"调度表里有行"的流程; 无调度行的流程不会被主动认领(仍可同步 start)。
+         zone 语义: 流程 sched_zone 为 NULL = 不钉区域(任意 zone 的 worker 都认领);
+                   流程 sched_zone 非 NULL = 只有 worker.zone 相等的才认领(worker.zone 为 NULL 时该式恒不成立, 自然跳过钉了区域的流程)。 -->
     <select id="findClaimableIdsByRoute" resultType="java.lang.String">
         SELECT i.proc_inst_id
         FROM ${orch.table.processInst} i
         JOIN ${orch.table.processSched} s ON s.proc_inst_id = i.proc_inst_id
         WHERE i.status = 'pending'
           AND s.sched_unit = #{unit}
-          AND s.sched_zone = #{zone}
+          AND (s.sched_zone IS NULL OR s.sched_zone = #{zone})
         ORDER BY i.auto_id ASC
         LIMIT #{limit}
     </select>
