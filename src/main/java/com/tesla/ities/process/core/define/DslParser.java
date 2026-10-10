@@ -157,11 +157,17 @@ public final class DslParser {
             p.items.addAll(parseItems());
             expect(')');
             if (p.name != null && p.items.isEmpty()) {
-                throw new ProcessException("AU204108", p.name);   // 同上, 兜住 "checks: " 这类带空白的写法
+                throw new ProcessException("AU204108", p.name);   // 同上, 兜住 "PARALLEL:checks( )" 这类带空白的写法
             }
             return p;
         }
         if (matchWord("IF")) {
+            skipWs();
+            if (pos < src.length() && src.charAt(pos) == ':') {
+                // IF 还没有"纯容器声明"这套口径(条件本身占着括号里的首位), 先把语法位占住报清楚,
+                // 免得写成 IF:名(...) 的人以为生效了——它只会在下一个 expect('(') 上报一句看不出根由的失配
+                throw new ProcessException("AU204110", "IF");
+            }
             expect('(');
             If iff = new If();
             iff.condition = readUntilCommaOrClose();   // 条件可能含空格/比较符

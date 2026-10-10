@@ -34,6 +34,8 @@ import java.util.concurrent.ConcurrentHashMap;
  * 调用纪律: **一次驱动只准调一次**。每次返回的都是不同对象, 在循环/策略里反复取会让同一次驱动内
  * 出现两份互不相干的定义(物化与监听器各改各的)。现有三个入口 create / drive / rollback 都恰好各取一次,
  * Materializer 对齐用的也是 dc.def() 那一份, 引用同一性天然保持。
+ * 唯一会连着借两份的场景是定义配了 autoRollback: 驱动收尾(终态 FAILED/STOPPED)随后调 RollbackService,
+ * 那次借出只活在回退路径里(回退不走 driveRoots, 不与驱动共享容器), 两份互不影响。
  *
  * 不需要失效入口: 定义表一表多版本且只 find/insert, key 含 version -> 发新版本天然是新条目,
  * 老条目继续服务钉死老版本的实例。唯一绕不过的情况是直接 UPDATE 同版本行(绕过引擎写库), 那只能重启清缓存。

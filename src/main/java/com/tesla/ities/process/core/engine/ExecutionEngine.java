@@ -48,6 +48,10 @@ import java.util.Map;
  * 取消(#6): 闸门只有 process_inst.status 一份真值, 由 NodeDriver 经 CancellationRegistry 当场读库,
  * 所以干预落在哪个节点都即时可见; 本引擎不持有任何取消状态, 收尾也无需清信号。
  *
+ * 自动回退(定义顶层 {@code autoRollback: true}): 收尾终态为 FAILED/STOPPED 时, 本引擎在**落库终态与发完流程
+ * after 监听器之后**调一次 RollbackService(见 {@link #autoRollback})。PAUSED 不触发(暂停可恢复), SUCCESS/SKIPPED
+ * 不触发; 回退失败只记日志, 不改调用方拿到的终态。除此之外回退照旧是人工入口(门面 doRollback)。
+ *
  * 启动结果返回: 终态原本算完就丢(finalizeProcess 的 fin 只落库/发监听), 现在 `start` 直接回调用结束时
  * 读到的流程状态, 让同步启动的门面能当场报成败, 不必再查一次库。三种"什么都没干"(行不存在/非 PENDING/
  * 被人抢先 claim)不抛异常也不造假状态, 只把当下读到的状态回去(读不到行 = null)。

@@ -56,11 +56,11 @@ public class ConditionEvaluatorTest {
     }
 
     @Test
-    public void bareLiteralsEvaluatedByTruthiness() {
+    public void bareLiteralsOnlyTrueIsTruthy() {
         Assert.assertTrue(eval("true"));
         Assert.assertFalse(eval("false"));
         Assert.assertFalse(eval("null"));
-        Assert.assertTrue(eval("anything"));   // 非空非 false/null -> 真
+        Assert.assertFalse(eval("anything"));   // 裸字面量仅 "true" 为真, 其余皆为假
     }
 
     @Test(expected = ProcessException.class)

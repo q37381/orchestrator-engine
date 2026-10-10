@@ -1,6 +1,7 @@
 package com.tesla.ities.process.core.define;
 
 import com.tesla.ities.process.core.model.ErrorPolicy;
+import com.tesla.ities.process.exception.ProcessException;
 import com.tesla.ities.process.util.Json;
 import org.junit.Assert;
 import org.junit.Test;
@@ -201,6 +202,42 @@ public class DefinitionLoaderTest {
 
         ProcessDefinition blank = loader.load("globalNodeListeners:\nglobalActionListeners:\nflow: \"a\"\n");
         Assert.assertTrue("段名写了但底下留空同样回空列表", blank.getGlobalNodeListeners().isEmpty());
+    }
+
+    // ===================== 自动回退开关(autoRollback) =====================
+
+    /** 声明值两档都解得到: true 才算开; 不写 / 写 false 都关(YAML 的 yes/on 本就解成 Boolean)。 */
+    @Test
+    public void autoRollbackSwitchParsesBothWays() {
+        ProcessDefinition on = loader.load("autoRollback: true\nflow: \"a\"\nnodes:\n  a:\n    handler: h\n");
+        Assert.assertEquals("true", on.getAutoRollback());
+        Assert.assertTrue("声明 true 才算开了自动回退", on.autoRollbackEnabled());
+
+        ProcessDefinition off = loader.load("autoRollback: false\nflow: \"a\"\nnodes:\n  a:\n    handler: h\n");
+        Assert.assertEquals("false", off.getAutoRollback());
+        Assert.assertFalse("显式关 = 不开", off.autoRollbackEnabled());
+
+        ProcessDefinition absent = loader.load("flow: \"a\"\nnodes:\n  a:\n    handler: h\n");
+        Assert.assertNull("不写 = 没声明(回退照旧只走人工)", absent.getAutoRollback());
+        Assert.assertFalse(absent.autoRollbackEnabled());
+
+        Assert.assertTrue("YAML yes 解成 Boolean true",
+                loader.load("autoRollback: yes\nflow: \"a\"\nnodes:\n  a:\n    handler: h\n").autoRollbackEnabled());
+        Assert.assertTrue("大小写与首尾空白不敏感",
+                loader.load("autoRollback: \" TRUE \"\nflow: \"a\"\nnodes:\n  a:\n    handler: h\n").autoRollbackEnabled());
+        Assert.assertNull("段名写了但底下留空 = 没声明(与整段缺失同口径)",
+                loader.load("autoRollback:\nflow: \"a\"\nnodes:\n  a:\n    handler: h\n").getAutoRollback());
+    }
+
+    /** 写了但拼错: 装载期当场拒, 不静默按"没配"跑——"我明明配了自动回退却没回退"这种坑不该拖到事故现场。 */
+    @Test
+    public void malformedAutoRollbackRejectedAtLoadTime() {
+        try {
+            loader.load("autoRollback: yesplease\nflow: \"a\"\nnodes:\n  a:\n    handler: h\n");
+            Assert.fail("非法 autoRollback 声明该在装载期就拒");
+        } catch (ProcessException e) {
+            Assert.assertEquals("AU204214", e.getMessageKey());
+        }
     }
 
     // ===================== flowOrder: 按 flow 顺序取全部节点 =====================

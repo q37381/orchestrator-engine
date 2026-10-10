@@ -2,15 +2,20 @@ package com.tesla.ities.process.integration;
 
 import com.tesla.ities.process.api.ProcessExecution;
 import com.tesla.ities.process.core.engine.RollbackService;
+import com.tesla.ities.process.core.model.RollbackStatus;
 import com.tesla.ities.process.core.model.Status;
 import com.tesla.ities.process.domain.ActionInstEntity;
 import com.tesla.ities.process.domain.NodeInstEntity;
 import com.tesla.ities.process.domain.ProcessInstEntity;
+import com.tesla.ities.process.domain.RollbackRecordEntity;
 import com.tesla.ities.process.util.Json;
 import org.junit.Assert;
 import org.junit.Test;
 
+import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
+import java.util.List;
 import java.util.Map;
 
 /**
@@ -308,5 +313,118 @@ public class EngineErrorRollbackTest extends EngineE2ETestBase {
         Assert.assertEquals(Status.SUCCESS, r.getStatus());
         ProcessInstEntity p = processMapper.findById(r.getProcInstId());
         Assert.assertEquals("prod-a", Json.readMap(p.getConfig()).get("cluster"));
+    }
+
+    // ===================== 自动回退(定义顶层 autoRollback) =====================
+
+    /** 配了 autoRollback 的流程失败: 收尾当场逆序补偿已成功的 action, 补偿记录的操作人标成 auto(与人工分开)。 */
+    @Test
+    public void autoRollbackFiresOnFailed() {
+        publish("arFail", ""
+                + "autoRollback: true\n"
+                + "flow: \"a,b\"\n"
+                + "nodes:\n  a:\n    handler: compOk\n  b:\n    handler: thrower\n");
+        ProcessExecution r = run("arFail");
+        Assert.assertEquals(Status.FAILED, r.getStatus());
+        Assert.assertTrue("已成功的 a 被自动撤销", rec.order.contains("compensate:compOk"));
+        RollbackRecordEntity row = rollbackMapper.findByProcess(r.getProcInstId()).get(0);
+        Assert.assertEquals(RollbackStatus.COMPENSATED.getStatus(), row.getStatus());
+        Assert.assertEquals("auto", row.getOperator());
+        Assert.assertEquals("流程终态不因回退改写", Status.FAILED.getStatus(),
+                processMapper.findById(r.getProcInstId()).getStatus());
+    }
+
+    /** 没配 autoRollback 时行为照旧: 失败只落终态, 一行都不补(默认仍只走人工回退)。 */
+    @Test
+    public void failedWithoutAutoRollbackCompensatesNothing() {
+        publish("arOff", ""
+                + "flow: \"a,b\"\n"
+                + "nodes:\n  a:\n    handler: compOk\n  b:\n    handler: thrower\n");
+        ProcessExecution r = run("arOff");
+        Assert.assertEquals(Status.FAILED, r.getStatus());
+        Assert.assertFalse("不该自动补偿", rec.order.contains("compensate:compOk"));
+        Assert.assertTrue(rollbackMapper.findByProcess(r.getProcInstId()).isEmpty());
+    }
+
+    /** 人工 stop 抢先把闸门翻成 STOPPED: 收尾读到的是库上真值, 同样触发自动回退。 */
+    @Test
+    public void autoRollbackFiresOnStopped() {
+        publish("arStop", ""
+                + "autoRollback: true\n"
+                + "flow: \"a,b,c\"\n"
+                + "nodes:\n  a:\n    handler: compOk\n  b:\n    handler: stopper\n  c:\n    handler: compOk\n");
+        String pid = facade.create("arStop", 1, null, "u1");
+        processMapper.claim(pid, "u1");                       // pending -> running(引擎已认领)
+        Assert.assertEquals(Status.STOPPED, engine.driveClaimed(pid));   // b 把闸门翻 stopped, c 被 drain 成 STOPPED
+        Assert.assertEquals("逆序撤销已成功的两步", Arrays.asList("b", "a"), compensatedActionDefs(pid));
+    }
+
+    /** 人工 pause 停在 PAUSED: 暂停是可恢复的, 不该顺手把副作用拆掉。 */
+    @Test
+    public void autoRollbackDoesNotFireOnPaused() {
+        publish("arPause", ""
+                + "autoRollback: true\n"
+                + "flow: \"a,b,c\"\n"
+                + "nodes:\n  a:\n    handler: compOk\n  b:\n    handler: thrower\n  c:\n    handler: compOk\n");
+        String pid = facade.create("arPause", 1, null, "u1");
+        processMapper.claim(pid, "u1");
+        Assert.assertTrue(facade.pause(pid, "op1"));          // running -> paused(闸门算取消但不算停止)
+        Assert.assertEquals(Status.PAUSED, engine.driveClaimed(pid));
+        Assert.assertTrue("暂停不触发自动回退", rollbackMapper.findByProcess(pid).isEmpty());
+    }
+
+    /** 成功终态一律不回退: autoRollback 只在坏终态生效, 正常跑完的流程不能被自己拆了。 */
+    @Test
+    public void autoRollbackKeepsSuccessfulProcessIntact() {
+        publish("arOk", ""
+                + "autoRollback: true\n"
+                + "flow: \"a\"\n"
+                + "nodes:\n  a:\n    handler: compOk\n");
+        ProcessExecution r = run("arOk");
+        Assert.assertEquals(Status.SUCCESS, r.getStatus());
+        Assert.assertTrue(rollbackMapper.findByProcess(r.getProcInstId()).isEmpty());
+    }
+
+    /**
+     * 配了 autoRollback 但没有任何成功 action(流程 before 就否决): 回退空转, 连回退前置切点都不拉
+     * (免得白取一次连接信息)。
+     */
+    @Test
+    public void autoRollbackWithNothingSucceededSkipsListeners() {
+        publish("arVeto", ""
+                + "autoRollback: true\n"
+                + "flow: \"a\"\n"
+                + "listeners:\n  - name: pVeto\n"
+                + "rollbackListeners:\n  - name: rbRecord\n"
+                + "nodes:\n  a:\n    handler: compOk\n");
+        ProcessExecution r = run("arVeto");
+        Assert.assertEquals(Status.FAILED, r.getStatus());
+        Assert.assertTrue(rollbackMapper.findByProcess(r.getProcInstId()).isEmpty());
+        Assert.assertFalse("无物可补时不白拉前置监听器", rec.order.contains("rollbackBefore"));
+    }
+
+    /** 自动回退补过的 action, 人工再回退一次不重复撤销(只看最新一条 rollback_record)。 */
+    @Test
+    public void manualRollbackAfterAutoDoesNotRecompensate() {
+        publish("arTwice", ""
+                + "autoRollback: true\n"
+                + "flow: \"a,b\"\n"
+                + "nodes:\n  a:\n    handler: compOk\n  b:\n    handler: thrower\n");
+        ProcessExecution r = run("arTwice");
+        Assert.assertEquals(Status.FAILED, r.getStatus());
+        RollbackService.RollbackReport rep = facade.doRollback(r.getProcInstId(), "u1");
+        Assert.assertTrue("已补偿的不重复撤销", rep.compensated.isEmpty());
+        Assert.assertEquals(1, rep.skipped.size());
+    }
+
+    /** 该流程**补偿成功**的那些 action 的定义 id, 按补偿执行顺序(rollback_record 的 auto_id 升序)。 */
+    private List<String> compensatedActionDefs(String procInstId) {
+        List<String> out = new ArrayList<>();
+        for (RollbackRecordEntity row : rollbackMapper.findByProcess(procInstId)) {
+            if (RollbackStatus.COMPENSATED.getStatus().equals(row.getStatus())) {
+                out.add(row.getActionDefId());
+            }
+        }
+        return out;
     }
 }

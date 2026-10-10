@@ -132,7 +132,11 @@ public class ProcessFacade {
         return intervention.requestRollback(procInstId, operator);
     }
 
-    /** 执行回退(逆序补偿), 返回报告。 */
+    /**
+     * 执行回退(逆序补偿), 返回报告。
+     * 定义配了顶层 {@code autoRollback: true} 时引擎会在驱动终态 FAILED/STOPPED 后自动补一轮(补偿记录 operator=auto),
+     * 那时这里再调一次通常只是空转: 已成功补偿的 action 不会被重复撤销。
+     */
     public RollbackService.RollbackReport doRollback(String procInstId, String operator) {
         return rollback.rollback(procInstId, operator);
     }

@@ -9,7 +9,7 @@ import org.springframework.stereotype.Component;
 /**
  * 条件求值器(无状态 Spring 单例, #5): 用于 IF(...) 和 action 的 when guard。
  * 先用 VariableResolver 把 ${...} 替换成实际值(ACTIVATION 期, 读 live vars/result), 再做轻量比较求值。
- * 支持: == != > < >= <=, && ||, 单引号字符串字面量, true/false。
+ * 支持: == != > < >= <=, && || !, 括号分组, 单引号字符串字面量; 裸字面量仅 "true" 为真(其余含 false/null/任意串皆为假)。
  *
  * 生产可替换为 SpEL / Aviator / MVEL(做成 ConditionEvaluator SPI)。
  * 铁律: guard 只能读持久化的 result/config/vars, 不得在求值里查活系统(保证恢复确定性)。
@@ -43,6 +43,11 @@ public class ConditionEvaluator {
     // ---- 极简递归下降求值(骨架级, 够表达 guard/IF) ----
     private boolean evalBool(String e) {
         e = e.trim();
+        // 整体被一对括号包裹(含 ((...)) 层层)时脱壳再递归: topLevel 会跳过括号内的运算符,
+        // 若不脱壳, "(a || b)" 这类整体包裹的子表达式会走到字面量分支被误判。
+        while (isFullyWrapped(e)) {
+            e = e.substring(1, e.length() - 1).trim();
+        }
         int or = topLevel(e, "||");
         if (or >= 0) {
             return evalBool(e.substring(0, or)) || evalBool(e.substring(or + 2));
@@ -62,6 +67,33 @@ public class ConditionEvaluator {
         }
         String v = strip(e);
         return "true".equalsIgnoreCase(v);
+    }
+
+    /** 整串是否被一对括号从首到尾完整包裹(忽略单引号内的括号)。 */
+    private boolean isFullyWrapped(String e) {
+        int n = e.length();
+        if (n < 2 || e.charAt(0) != '(' || e.charAt(n - 1) != ')') {
+            return false;
+        }
+        int depth = 0;
+        boolean sq = false;
+        for (int i = 0; i < n; i++) {
+            char c = e.charAt(i);
+            if (c == '\'') {
+                sq = !sq;
+            } else if (!sq) {
+                if (c == '(') {
+                    depth++;
+                } else if (c == ')') {
+                    depth--;
+                    // 首个左括号在到达末尾前就闭合了 -> 不是整体包裹(如 "(a) && (b)")
+                    if (depth == 0 && i < n - 1) {
+                        return false;
+                    }
+                }
+            }
+        }
+        return depth == 0;
     }
 
     private boolean compare(String l, String op, String r) {

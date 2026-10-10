@@ -26,7 +26,7 @@ public class DispatcherTest {
 
     /** 记录 driveClaimed 调用次数的引擎替身(避免真实认领打库)。 */
     private static ExecutionEngine countingEngine(AtomicInteger calls, CountDownLatch latch) {
-        return new ExecutionEngine(null, null, null, null, null, null, null, null, null) {
+        return new ExecutionEngine(null, null, null, null, null, null, null, null, null, null) {
             @Override
             public Status driveClaimed(String procInstId) {
                 calls.incrementAndGet();

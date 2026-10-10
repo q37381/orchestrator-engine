@@ -94,6 +94,7 @@ public class InterventionService {
 
     /**
      * 回退请求(向后恢复): 把闸门翻成 STOPPED 落库, 实际逆序补偿由 RollbackService 完成。默认人工触发。
+     * (定义配了 autoRollback 时不必再点这一步: 驱动收尾读到 STOPPED/FAILED 就会自己补。)
      * 闸门必须入库而不是本机置位 —— 驱动可能跑在别的节点, 只有 process_inst.status 两边都读得到。
      * 已是取消态(FAILED/PAUSED/STOPPED)就不动状态, 免得把"因何停住"的原态抹平。
      */

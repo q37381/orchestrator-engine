@@ -23,6 +23,7 @@ import java.util.concurrent.atomic.AtomicInteger;
  *  - 改副本(含 vars 嵌套子 map、节点 config、监听器 config、nodes 表、flow、actions 列表)**不会污染缓存**,
  *    下一次借出仍是定义原样——监听器/handler 手滑赋值不再留下永久脏定义;
  *  - 副本内容与原定义**逐字节等价**(canonical JSON 比对), 标量/嵌套结构都不丢;
+ *  - 流程级单值声明(errorPolicy / autoRollback)同样随快照往返, 副本上改写不回灌缓存;
  *  - YAML 只在快照未命中时解析一次(第二次借出不得再查库)。
  */
 public class DefinitionCopyTest {
@@ -30,6 +31,7 @@ public class DefinitionCopyTest {
     private static final String YAML = String.join("\n",
             "materialization: eager",
             "errorPolicy: continue_on_error",
+            "autoRollback: true",
             "vars:",
             "  table: t_order",
             "  limit: 5",
@@ -152,6 +154,7 @@ public class DefinitionCopyTest {
         dirty.getNodes().remove("checkB");
         dirty.setFlow("evil");
         dirty.setErrorPolicy("fail_fast");
+        dirty.setAutoRollback("false");
         dirty.setMaterialization(ProcessDefinition.Materialization.LAZY);
 
         ProcessDefinition fresh = cache.definition("copy-test", 1);
@@ -176,6 +179,8 @@ public class DefinitionCopyTest {
         Assert.assertEquals("物化时机未被改写", ProcessDefinition.Materialization.EAGER, fresh.getMaterialization());
         Assert.assertTrue("物化时机未被改写", fresh.isEager());
         Assert.assertEquals("全局错误策略未被改写", ErrorPolicy.CONTINUE_ON_ERROR, fresh.globalErrorPolicy());
+        Assert.assertEquals("自动回退开关未被改写", "true", fresh.getAutoRollback());
+        Assert.assertTrue("副本上写的 false 没跟着污染缓存", fresh.autoRollbackEnabled());
     }
 
     @Test
@@ -201,6 +206,8 @@ public class DefinitionCopyTest {
         Assert.assertEquals("setup + flow + setdown", 5, d.orderedRoots().size());
         Assert.assertEquals(1, d.setupSize());
         Assert.assertEquals(1, d.setdownSize());
+        Assert.assertEquals("自动回退开关随快照往返", "true", d.getAutoRollback());
+        Assert.assertTrue("开关的派生判定读的是声明值", d.autoRollbackEnabled());
 
         // 派生标记走定义字段而非快照属性(节点自己优先/未声明回落全局)
         Assert.assertTrue(d.node("migrate").isSharded());

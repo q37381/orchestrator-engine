@@ -85,14 +85,14 @@ public class ProcessEngineConfigTest {
     @Test
     public void parallelExecutePoolBeanIsConfigured() {
         ThreadPoolTaskExecutor ex = new ProcessEngineConfig().itiesProcessParallelExecutePool();
-        Assert.assertEquals(8, ex.getCorePoolSize());
-        Assert.assertEquals(64, ex.getMaxPoolSize());
-        Assert.assertEquals(256, ex.getQueueCapacity());
+        Assert.assertEquals(16, ex.getCorePoolSize());
+        Assert.assertEquals(16, ex.getMaxPoolSize());
+        Assert.assertEquals(20000, ex.getQueueCapacity());
         Assert.assertEquals("ities-process-node-", ex.getThreadNamePrefix());
         ex.shutdown();
     }
 
-    /** 三档池默认同规格(8/64/256/60), 但前缀各自独立便于日志区分; sizing 走 @Value, 非 Spring 直接 new 时取字段初始值。 */
+    /** 三档池默认同规格(16/16/20000/600), 但前缀各自独立便于日志区分; sizing 走 @Value, 非 Spring 直接 new 时取字段初始值。 */
     @Test
     public void threePoolsShareDefaultsButDistinctPrefixes() {
         ProcessEngineConfig c = new ProcessEngineConfig();
@@ -100,10 +100,10 @@ public class ProcessEngineConfigTest {
         ThreadPoolTaskExecutor shard = c.itiesProcessActionShardParallelExecutePool();
         ThreadPoolTaskExecutor action = c.itiesProcessActionParallelExecutePool();
         for (ThreadPoolTaskExecutor ex : new ThreadPoolTaskExecutor[]{node, shard, action}) {
-            Assert.assertEquals(8, ex.getCorePoolSize());
-            Assert.assertEquals(64, ex.getMaxPoolSize());
-            Assert.assertEquals(256, ex.getQueueCapacity());
-            Assert.assertEquals(60, ex.getKeepAliveSeconds());
+            Assert.assertEquals(16, ex.getCorePoolSize());
+            Assert.assertEquals(16, ex.getMaxPoolSize());
+            Assert.assertEquals(20000, ex.getQueueCapacity());
+            Assert.assertEquals(600, ex.getKeepAliveSeconds());
         }
         Assert.assertEquals("ities-process-node-", node.getThreadNamePrefix());
         Assert.assertEquals("ities-process-shard-", shard.getThreadNamePrefix());

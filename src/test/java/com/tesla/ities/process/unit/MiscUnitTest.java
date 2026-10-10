@@ -427,10 +427,11 @@ public class MiscUnitTest {
         Assert.assertTrue(actx.isCancelled());
     }
 
-    @Test(expected = ProcessException.class)
-    public void actionContextWithoutPayloadThrows() {
+    /** 无参 shardPayload() 只做转型, 非分片(payload=null)时静默返回 null; 需要类型转换才走 shardPayload(Class) 那条。 */
+    @Test
+    public void actionContextWithoutPayloadReturnsNull() {
         ActionContext actx = new ActionContext(new ProcessContext("p"), "A", "d", null, null);
-        actx.shardPayload();
+        Assert.assertNull(actx.shardPayload());
     }
 
     /** Jackson 转换目标 POJO。 */

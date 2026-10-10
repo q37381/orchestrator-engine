@@ -121,6 +121,7 @@ public abstract class EngineE2ETestBase {
     protected NodeInstMapper nodeMapper;
     protected ActionInstMapper actionMapper;
     protected LaneMapper laneMapper;
+    protected RollbackRecordMapper rollbackMapper;
 
     private final Db db = new Db();
     // 三档并发各用一池(与生产装配同口径): node 扇出 / shard lane 扇出 / action 序列扇出
@@ -141,7 +142,7 @@ public abstract class EngineE2ETestBase {
         nodeMapper = mapper(NodeInstMapper.class, this::nodeInst);
         laneMapper = mapper(LaneMapper.class, this::lane);
         actionMapper = mapper(ActionInstMapper.class, this::actionInst);
-        RollbackRecordMapper rollbackMapper = mapper(RollbackRecordMapper.class, this::rollbackRecord);
+        rollbackMapper = mapper(RollbackRecordMapper.class, this::rollbackRecord);
 
         VariableResolver resolver = new VariableResolver();
         ConditionEvaluator evaluator = new ConditionEvaluator(resolver);
@@ -150,7 +151,7 @@ public abstract class EngineE2ETestBase {
 
         ActionHandlerRegistry handlers = new ActionHandlerRegistry(Arrays.asList(
                 ok(), thrower(), skipper(), nuller(), varWriter(), flagTrue(), echoConfig(), placeToGroup(),
-                compOk(), compDefault(), compFail(), nonComp(), dbMigrate()));
+                compOk(), compDefault(), compFail(), nonComp(), dbMigrate(), stopper()));
         ShardResolverRegistry shardResolvers = new ShardResolverRegistry(
                 Collections.singletonList(dbTopology()));
         ProcessListenerRegistry processListeners = new ProcessListenerRegistry(
@@ -186,15 +187,17 @@ public abstract class EngineE2ETestBase {
         NodeDriver driver = new NodeDriver(nodeMapper, laneMapper, actionMapper, processMapper,
                 handlers, listenerEngine, observerEngine, ctxFactory, cancellation, leafMaterializer, actionPool, strategies);
 
+        RollbackService rollbackService = new RollbackService(processMapper, nodeMapper, laneMapper, actionMapper,
+                rollbackMapper, handlers, ctxFactory, listenerEngine, defCache, resolver, ids);
+        // 自动回退(定义顶层 autoRollback)由引擎收尾直接调 RollbackService, 所以它与门面用的是**同一个**实例
         engine = new ExecutionEngine(processMapper, listenerEngine, observerEngine, defCache, ctxFactory,
-                driver, resolver, evaluator, materializer);
+                driver, resolver, evaluator, materializer, rollbackService);
         PlanService planService = new PlanService(processMapper, defMapper, defCache, materializer,
                 ctxFactory, resolver, evaluator, ids);
         facade = new ProcessFacade(planService, engine,
                 new InterventionService(processMapper, nodeMapper, actionMapper),
                 new ProgressService(nodeMapper, laneMapper, actionMapper),
-                new RollbackService(processMapper, nodeMapper, laneMapper, actionMapper, rollbackMapper,
-                        handlers, ctxFactory, listenerEngine, defCache, resolver, ids));
+                rollbackService);
     }
 
     @After
@@ -455,6 +458,21 @@ public abstract class EngineE2ETestBase {
         when(h.handle(any())).thenAnswer(i -> {
             ActionContext ctx = i.getArgument(0);
             ctx.putResult("shardKey", ctx.shardKey());
+            return Status.SUCCESS;
+        });
+        when(h.compensable()).thenReturn(true);
+        return h;
+    }
+
+    /**
+     * 运行中把所属流程 CAS 成 STOPPED(模拟人工 stop 抢先落库), 自己则成功返回。
+     * 可补偿: 自动回退用例要靠它把终态做成 STOPPED, 从而验证"停止后也回退"这条触发条件。
+     */
+    private ActionHandler stopper() throws Exception {
+        ActionHandler h = handler("stopper", ctx -> {
+            String pid = ctx.node().inst().getProcInstId();
+            processMapper.casStatus(pid, Status.RUNNING.getStatus(), Status.STOPPED.getStatus(), "op1");
+            rec.order.add("handler:stopper");
             return Status.SUCCESS;
         });
         when(h.compensable()).thenReturn(true);

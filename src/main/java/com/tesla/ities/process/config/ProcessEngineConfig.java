@@ -52,7 +52,7 @@ import java.util.concurrent.ThreadPoolExecutor;
  *   <li>{@code itiesProcessActionParallelExecutePool} — action 并发(容器内 action 序列扇出, 需 {@code actionExecution: PARALLEL})</li>
  * </ul>
  * 每档 sizing 独立配置(上下文里 {@code ities.process.<node|shard|action>.*}), 键为
- * {@code core-size}/{@code max-size}/{@code queue-capacity}/{@code keep-alive-seconds}, 默认都是 8/64/256/60;
+ * {@code core-size}/{@code max-size}/{@code queue-capacity}/{@code keep-alive-seconds}, 默认都是 16/16/20000/600;
  * 要更彻底地自定义某一档, 声明同名 Bean 覆盖即可。
  *
  * <h3>业务键序列(消费者提供五个 Bean)</h3>

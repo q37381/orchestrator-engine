@@ -12,6 +12,11 @@ materialization: LAZY
 # (含 PARALLEL/IF 控制节点与其分片 lane), 节点自己的声明优先——本例逐节点写清了, 所以不吃全局。
 # errorPolicy: CONTINUE_ON_ERROR
 
+# 可选的自动回退(默认关): 配成 true 后, 本次驱动的终态是 FAILED 或 STOPPED 时, 引擎收尾就当场逆序补偿
+# 已成功且可补偿的 action(handler.compensable()=true 才补, 补过的不重复撤)。不配就照旧只走人工回退入口。
+# 只声明在流程级——回退撤销的是整条流程的副作用; 补偿自己的前置/收尾用下面的 rollbackListeners。
+# autoRollback: true
+
 # vars: 流程级变量空间, 物化期与运行期(handler putVar)都可解析/写入(#7); ${vars.*} 在物化期就地替换成字面量(#12)。
 # config: 各层落库的配置桶**同名**, ${config.*} 本层优先、沿父链上溯 —— 流程级 config 就是创建输入,
 #   所以节点/action 里写 ${config.cluster} 就能拿到 create 时传的 cluster(任何阶段都解得开)。
