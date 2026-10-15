@@ -1,11 +1,8 @@
 package com.tesla.ities.process.core.engine;
 
 import com.tesla.ities.process.core.context.ProcessContext;
-import com.tesla.ities.process.core.define.DslParser;
 import com.tesla.ities.process.core.define.ListenerDef;
 import com.tesla.ities.process.core.define.ProcessDefinition;
-import com.tesla.ities.process.core.model.ErrorPolicy;
-import com.tesla.ities.process.domain.NodeInstEntity;
 import com.tesla.ities.process.util.Errors;
 import com.tesla.ities.process.util.Json;
 import com.tesla.ities.process.core.model.Status;
@@ -38,7 +35,7 @@ import java.util.Map;
  * 流程级监听器链从**定义推导**(process_inst 钉死 def_version, 定义不可变, 结果恒定), 直接以
  * List&lt;ListenerDef&gt; 传入 ListenerEngine, 不再固化快照列、不再转 Map。
  *
- * 流程级 vars/result 都由脏标记驱动落库(NodeDriver.flushProcessState): 驱动中随时刷, 收尾再刷一次,
+ * 流程级 vars/result 都由脏标记驱动落库(ProcessStateFlusher.flush): 驱动中随时刷, 收尾再刷一次,
  * 所以 after 监听器写进流程级 result 的内容也能落住。
  *
  * 失败记录(#14 延伸): 引擎各层 catch 到的异常都经 ProcessContext.recordFailure 攒成**一条**摘要(首个胜出),
@@ -52,6 +49,15 @@ import java.util.Map;
  * 自动回退(定义顶层 {@code autoRollback: true}): 收尾终态为 FAILED/STOPPED 时, 本引擎在**落库终态与发完流程
  * after 监听器之后**调一次 RollbackService(见 {@link #autoRollback})。PAUSED 不触发(暂停可恢复), SUCCESS/SKIPPED
  * 不触发; 回退失败只记日志, 不改调用方拿到的终态。除此之外回退照旧是人工入口(门面 doRollback)。
+ *
+ * 向前重放(恢复现场, Saga 闭环的另一半): 认领之后、顶层走查之前调一次 RestoreService.replay(见 {@link #driveClaimed})
+ * ——这一流程若回退过, 重试重新驱动前先把被撤销的副作用按执行顺序正序施加回来, 于是失败节点在恢复好的现场上续跑。
+ * 这是三条重新驱动入口(门面 start / Dispatcher 认领 / 干预 requeue)唯一的汇聚点, 故重放只接这一处; 从没回退过的
+ * 流程只多一次 findByProcess 空查询即返回。重放失败当场挂起(落 FAILED 且不触发 autoRollback), 不向前驱动。
+ *
+ * 让渡(handler 返回 pending/paused/suspended): 顶层走查非终态返回 = 本轮退出——节点 setdown 与顶层 setdown
+ * 都不跑、流程行 CAS 成让渡态落库, 不发 after、不触发 autoRollback(见 {@link #yieldProcess});
+ * 重入(pending 由 Dispatcher 重捞 / paused 由 resume)后从非终态行续跑, 让渡行重跑(见 {@link LayerWalker} 重入过滤)。
  *
  * 启动结果返回: 终态原本算完就丢(finalizeProcess 的 fin 只落库/发监听), 现在 `start` 直接回调用结束时
  * 读到的流程状态, 让同步启动的门面能当场报成败, 不必再查一次库。三种"什么都没干"(行不存在/非 PENDING/
@@ -79,14 +85,15 @@ public class ExecutionEngine {
     private final NodeDriver driver;
     private final VariableResolver resolver;
     private final ConditionEvaluator evaluator;
-    private final Materializer materializer;
+    private final ProcessStateFlusher flusher;
     private final RollbackService rollback;
+    private final RestoreService restore;
 
     public ExecutionEngine(ProcessInstMapper processMapper,
                            ListenerEngine listeners, ObserverEngine observers, DefinitionCache defCache,
                            ContextFactory ctxFactory, NodeDriver driver,
-                           VariableResolver resolver, ConditionEvaluator evaluator, Materializer materializer,
-                           RollbackService rollback) {
+                           VariableResolver resolver, ConditionEvaluator evaluator,
+                           ProcessStateFlusher flusher, RollbackService rollback, RestoreService restore) {
         this.processMapper = processMapper;
         this.listeners = listeners;
         this.observers = observers;
@@ -95,8 +102,9 @@ public class ExecutionEngine {
         this.driver = driver;
         this.resolver = resolver;
         this.evaluator = evaluator;
-        this.materializer = materializer;
+        this.flusher = flusher;
         this.rollback = rollback;
+        this.restore = restore;
     }
 
     // ===================== 流程启动(认领 + 驱动) =====================
@@ -148,7 +156,20 @@ public class ExecutionEngine {
             return autoRollback(dc, def, finalizeProcess(dc, procChain, Status.FAILED));
         }
 
-        return autoRollback(dc, def, finalizeProcess(dc, procChain, driveRoots(dc, def)));
+        // 向前重放(恢复现场): 这一流程若回退过(定义 autoRollback 或点过回退), 重试重新驱动前先把被撤销的副作用
+        // 按执行顺序正序施加回来, 于是失败节点在恢复好的现场上续跑而非从流程头重跑(见 RestoreService)。
+        // 从没回退过的流程只多一次 findByProcess 空查询即返回, 不拖慢正常驱动; 排在 before 之后 => 否决轮不重放。
+        RestoreService.RestoreReport replay = restore.replay(procInstId, dc.processContext().userId());
+        if (replay.hasFailure()) {
+            // 现场半恢复 = 坏状态: 落 FAILED 供修好后再次重试(RESTORE_FAILED 记录仍在, 下次驱动从没立稳那条接着放),
+            // 但这条路**刻意不触发 autoRollback**——补偿上一轮已做过, 现场没立稳时再逆序撤销只会把状态搅得更乱。
+            // 重放失败没有裸异常可收成摘要(RestoreService 已把它落成 RESTORE_FAILED 记录), 这里直接把那条因由记进流程。
+            dc.processContext().recordFailure("向前重放失败(process=" + procInstId + "): " + replay.firstFailure());
+            log.warn("向前重放失败, 挂起不向前驱动 proc={} 失败={}", procInstId, replay.failed);
+            return finalizeProcess(dc, procChain, Status.FAILED);
+        }
+
+        return autoRollback(dc, def, finalizeProcess(dc, procChain, driveRoots(dc)));
     }
 
     /**
@@ -186,38 +207,19 @@ public class ExecutionEngine {
     }
 
     /**
-     * 顶层走查: setup(前置) + flow(主流程) + setdown(收尾 finally)。
-     * 行与 orderedRoots 按下标对齐; setup/flow 段遇坏是否跳过剩余 = **就近声明优先**
-     * (那一项自己声明了 errorPolicy 就听它的, 没声明才回落流程级全局), setdown 段始终执行。
-     * LAZY 下走查到第 i 个才物化第 i 个根(rootAt); EAGER 下节点行创建期已建全, rootAt 只定位对齐。
+     * 顶层走查: 装配与走查口径**全部归驱动层**——{@link NodeDriver#driveRoots} 把定义翻成
+     * {@link LayerWalker#walkRoots} 的入参(不设取消闸门、收敛按**就近声明优先**、setdown 段恒不收敛)。
+     * 本方法只管异常兜底: 顶层走查自己炸了(如 flow 引用未定义节点、物化失败)时, 因由除了进日志
+     * 也记进流程那一条, 不让流程僵在 running 且原因只躺在日志里。
      */
-    private Status driveRoots(DriveContext dc, ProcessDefinition def) {
-        List<DslParser.Expr> ordered = def.orderedRoots();
-        boolean eager = def.isEager();
-        // 根序列属于流程这一层容器: 回落口径是全局 errorPolicy, 但根自己写了声明就就近优先(仅此层跨层看声明)
-        ErrorPolicy layer = def.globalErrorPolicy();
-        int flowStart = def.setupSize();                              // setup 段 [0, flowStart)
-        int flowEnd = flowStart + def.roots().size();                 // flow 段 [flowStart, flowEnd)
-        Status s = Status.SUCCESS;
-
+    private Status driveRoots(DriveContext dc) {
         try {
-            for (int i = 0; i < ordered.size(); i++) {
-                NodeInstEntity root = materializer.rootAt(dc, ordered, i, eager);
-                // 只按**本根**这一条判收敛: 聚合值会带着更早那次的坏, 用它判会把没吭声的后续根一起误杀
-                Status one = driver.driveNode(dc, root);
-                s = Status.aggregate(s, one);
-                if (i < flowEnd && (one == Status.FAILED || one == Status.STOPPED)
-                        && def.stopsSequence(root.getDef(), layer)) {
-                    i = flowEnd - 1;   // 收敛: 跳过 setup/flow 剩余(循环自增后从 setdown 段继续)
-                }
-            }
+            return driver.driveRoots(dc);
         } catch (Exception e) {
             log.error("驱动流程异常 proc={}", dc.procInstId(), e);
-            // 顶层走查自己炸了(如 flow 引用未定义节点、物化失败): 因由除了进日志也记进流程那一条
             dc.processContext().recordFailure(Errors.describe(e, "驱动流程异常", "process=" + dc.procInstId()));
-            s = Status.FAILED;
+            return Status.FAILED;
         }
-        return s;
     }
 
     private DriveContext buildDriveContext(ProcessInstEntity p) {
@@ -230,19 +232,23 @@ public class ExecutionEngine {
     // ===================== 流程收尾 =====================
 
     /**
-     * 流程收尾: 落那一条失败记录 + 落终态 + 发 after。
+     * 流程收尾: 落那一条失败记录 + 落终态 + 发 after; handler 让渡(过程态返回)则落让渡态退出等重入。
      *
-     * @return 落库成功 = 聚合终态 fin; 被人工 STOP/PAUSE 抢先翻走 = 重读 DB 拿实际状态(以 DB 为真值)
+     * @return 落库成功 = 聚合终态或让渡态; 被人工 STOP/PAUSE 抢先翻走 = 重读 DB 拿实际状态(以 DB 为真值)
      */
     private Status finalizeProcess(DriveContext dc, List<ListenerDef> procChain, Status aggStatus) {
         String procInstId = dc.procInstId();
+        // 让渡(handler 返回过程态): 必须在下面 aggregate 之前判定——severity=0 的过程态会被聚合吞成 SUCCESS。
+        if (aggStatus != null && !aggStatus.isTerminal()) {
+            return yieldProcess(dc, aggStatus);
+        }
         // SKIPPED/SUCCESS 对流程都算成功完成; 终态按 severity 优先级聚合(FAILED > STOPPED > SUCCESS)
         Status fin = Status.aggregate(Status.SUCCESS, aggStatus);
         // 坏终态才把驱动中记下的首条异常摘要落 process_inst.result.__error; 好终态传 null = 摘掉上一轮残留
         // (重跑成功后不该还挂着失败信息)。写走脏标记, 随下面这次 flush 与 vars 同条 updateState 落库。
         dc.processContext().settleFailure(fin == Status.FAILED || fin == Status.STOPPED
                 ? dc.processContext().failure() : null);
-        driver.flushProcessState(dc, dc.processContext());
+        flusher.flush(dc, dc.processContext());
         // 仅当仍是 RUNNING(未被人工 STOP/PAUSE 抢先翻走)才落终态
         boolean settled = processMapper.casStatus(procInstId, Status.RUNNING.getStatus(), fin.getStatus(),
                 dc.processContext().userId()) == 1;
@@ -251,12 +257,31 @@ public class ExecutionEngine {
             dc.processContext().putAllVars(Json.readMap(fresh.getVars()));
             listeners.processAfter(procChain, dc.processContext(), fin);   // 纯通知
             observers.processAfter(dc.processContext(), fin);              // 全局 Observer.after
-            driver.flushProcessState(dc, dc.processContext());             // 收尾监听器写的 vars/result 也落库
+            flusher.flush(dc, dc.processContext());             // 收尾监听器写的 vars/result 也落库
             log.info("流程结束 proc={} status={}", procInstId, fin);
             return fin;
         }
         Status actual = readStatus(procInstId);
         log.info("流程收尾时状态被抢先翻走 proc={} 聚合={} 实际={}", procInstId, fin, actual);
+        return actual;
+    }
+
+    /**
+     * 让渡收尾(handler 返回 pending/paused/suspended): flush vars/result -> CAS running→让渡态, 本轮退出等重入。
+     *  - 不发 processAfter / Observer.after——流程未完成, 监听器/观察者只认终态(重入真正完成后才收尾);
+     *  - 不触发 autoRollback(只认 FAILED/STOPPED, 天然不触发);
+     *  - 失败摘要按"非坏终态"口径摘除上一轮残留(重入后重新计);
+     *  - 让渡行(result/visit_count)已在 ActionRunner 落库, 这里只管流程级状态与桶。
+     */
+    private Status yieldProcess(DriveContext dc, Status yieldStatus) {
+        String procInstId = dc.procInstId();
+        dc.processContext().settleFailure(null);
+        flusher.flush(dc, dc.processContext());
+        boolean settled = processMapper.casStatus(procInstId, Status.RUNNING.getStatus(),
+                yieldStatus.getStatus(), dc.processContext().userId()) == 1;
+        Status actual = settled ? yieldStatus : readStatus(procInstId);
+        log.info("流程让渡 proc={} status={} 本轮退出等重入(pending 由调度重捞 / paused 等 resume / suspended 停驻)",
+                procInstId, actual);
         return actual;
     }
 

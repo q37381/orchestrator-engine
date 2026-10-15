@@ -7,6 +7,9 @@ import com.tesla.ities.process.core.context.ProcessContext;
 import com.tesla.ities.process.domain.NodeInstEntity;
 import org.junit.Assert;
 import org.junit.Test;
+import org.junit.runner.RunWith;
+import org.mockito.InjectMocks;
+import org.mockito.junit.MockitoJUnitRunner;
 
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -14,10 +17,15 @@ import java.util.Map;
 /**
  * 占位符解析单测(无 DB/无 Spring): 聚焦**间接键**(路径里嵌占位符)与两档时机/两轮严格度。
  * 引擎不认得任何业务键名 —— 本测试刻意用 dbKind/sqlByType 这类自定义名字, 证明选支能力不依赖保留字。
+ *
+ * 解析器无协作者(上下文由入参传入), 按 {@code @InjectMocks} 口径由 Mockito 造; 传进去的
+ * ProcessContext/ActionContext 是**真实上下文对象**(被测语义就落在这份桶上), 不做替身。
  */
+@RunWith(MockitoJUnitRunner.class)
 public class VariableResolverTest {
 
-    private final VariableResolver resolver = new VariableResolver();
+    @InjectMocks
+    private VariableResolver resolver;
 
     // ===================== 端到端: PLAN 冻结 -> 列内容 -> ACTIVATION 给 handler 的值 =====================
 

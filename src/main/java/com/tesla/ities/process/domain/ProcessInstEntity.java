@@ -5,7 +5,7 @@ import java.time.LocalDateTime;
 /** process_inst 行(持久化实体)。config/vars/result 以 JSON 文本存储, 应用层转换(params 桶不落库)。 */
 public class ProcessInstEntity {
     private Long autoId;            // 物理主键, 应用不直接使用
-    private String procInstId;      // 业务键 varchar(20)
+    private String procInstId;      // 业务键 varchar(32)
     private String processDefId;
     private Integer defVersion;
     private String status;

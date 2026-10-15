@@ -110,7 +110,7 @@ public class EngineErrorPolicyScopeTest extends EngineE2ETestBase {
 
     /**
      * 聚合节点(GROUP)作为根时, 组行的生效值参与根序列的收敛判定(命名容器三条路都通)。
-     * 注意口径: 就近声明**只作用于根序列这一层**, 组内子节点声明不跨层(见 GroupStrategy)。
+     * 注意口径: 就近声明**只作用于根序列这一层**, 组内子节点声明不跨层(见 GroupKind)。
      */
     @Test
     public void groupFailFastStopsRemainingRoots() {

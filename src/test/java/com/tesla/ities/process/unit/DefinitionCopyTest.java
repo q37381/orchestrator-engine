@@ -1,5 +1,6 @@
 package com.tesla.ities.process.unit;
 
+import com.tesla.ities.process.core.define.ActionDef;
 import com.tesla.ities.process.core.define.DefinitionLoader;
 import com.tesla.ities.process.core.define.DslParser;
 import com.tesla.ities.process.core.define.ProcessDefinition;
@@ -10,12 +11,24 @@ import com.tesla.ities.process.mapper.ProcessInstMapper;
 import com.tesla.ities.process.core.runtime.DefinitionCache;
 import com.tesla.ities.process.util.Json;
 import org.junit.Assert;
+import org.junit.Before;
 import org.junit.Test;
+import org.junit.runner.RunWith;
+import org.mockito.InjectMocks;
+import org.mockito.Mock;
+import org.mockito.Spy;
+import org.mockito.junit.MockitoJUnitRunner;
 
-import java.lang.reflect.Proxy;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.atomic.AtomicInteger;
+
+import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.isNull;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
 /**
  * 定义缓存的**借出隔离**契约(DefinitionCache 缓存 JSON 快照, 每次读回私有副本):
@@ -25,7 +38,11 @@ import java.util.concurrent.atomic.AtomicInteger;
  *  - 副本内容与原定义**逐字节等价**(canonical JSON 比对), 标量/嵌套结构都不丢;
  *  - 流程级单值声明(errorPolicy / autoRollback)同样随快照往返, 副本上改写不回灌缓存;
  *  - YAML 只在快照未命中时解析一次(第二次借出不得再查库)。
+ *
+ * 装配口径: 两张 mapper 是 {@code @Mock}(只回放 find), 缓存本体 {@code @InjectMocks};
+ * DefinitionLoader 跑真身(@Spy)——本类钉的是缓存的隔离语义, 解析必须是真 YAML。
  */
+@RunWith(MockitoJUnitRunner.class)
 public class DefinitionCopyTest {
 
     private static final String YAML = String.join("\n",
@@ -93,32 +110,31 @@ public class DefinitionCopyTest {
             "  skipBranch: { handler: n }",
             "  release: { handler: rel }");
 
-    /** 计数 find 调用次数, 用来证明"YAML 只解析一次"。 */
-    private static DefinitionCache cacheCounting(AtomicInteger loads) {
+    @Mock
+    private ProcessDefinitionMapper defMapper;
+    @Mock
+    private ProcessInstMapper procMapper;
+    @Spy
+    private DefinitionLoader loader = new DefinitionLoader();
+    @InjectMocks
+    private DefinitionCache cache;
+
+    /** 主用例那一条已发布定义(按 (defId, version) 精确定位, status 不参与收窄)。 */
+    @Before
+    public void publishCopyTestDefinition() {
+        when(defMapper.find("copy-test", 1, null)).thenReturn(defRow("copy-test", 1, YAML));
+    }
+
+    private static ProcessDefinitionEntity defRow(String defId, int version, String yaml) {
         ProcessDefinitionEntity row = new ProcessDefinitionEntity();
-        row.setProcessDefId("copy-test");
-        row.setVersion(1);
-        row.setDefinition(YAML);
-        ProcessDefinitionMapper defMapper = (ProcessDefinitionMapper) Proxy.newProxyInstance(
-                ProcessDefinitionMapper.class.getClassLoader(), new Class<?>[]{ProcessDefinitionMapper.class},
-                (p, meth, args) -> {
-                    if ("find".equals(meth.getName())) {
-                        loads.incrementAndGet();
-                        return row;
-                    }
-                    return null;
-                });
-        ProcessInstMapper procMapper = (ProcessInstMapper) Proxy.newProxyInstance(
-                ProcessInstMapper.class.getClassLoader(), new Class<?>[]{ProcessInstMapper.class},
-                (p, meth, args) -> null);
-        return new DefinitionCache(defMapper, procMapper, new DefinitionLoader());
+        row.setProcessDefId(defId);
+        row.setVersion(version);
+        row.setDefinition(yaml);
+        return row;
     }
 
     @Test
     public void eachBorrowReturnsADistinctObjectGraph() {
-        AtomicInteger loads = new AtomicInteger();
-        DefinitionCache cache = cacheCounting(loads);
-
         ProcessDefinition a = cache.definition("copy-test", 1);
         ProcessDefinition b = cache.definition("copy-test", 1);
 
@@ -132,25 +148,26 @@ public class DefinitionCopyTest {
         Assert.assertNotSame("监听器 config 不共享",
                 a.getListeners().get(0).getConfig(), b.getListeners().get(0).getConfig());
         Assert.assertEquals("副本内容与原定义逐字节等价", Json.write(a), Json.write(b));
-        Assert.assertEquals("YAML 只解析一次(第二次借出不得回库)", 1, loads.get());
+        // YAML 只解析一次: 第二次借出没回库
+        verify(defMapper, times(1)).find("copy-test", 1, null);
     }
 
     @Test
+    @SuppressWarnings("unchecked")
     public void mutatingTheCopyDoesNotPolluteTheCache() {
-        DefinitionCache cache = cacheCounting(new AtomicInteger());
         ProcessDefinition dirty = cache.definition("copy-test", 1);
 
         // 把各个已知的"外泄口"全写一遍: 这些在旧实现里都会永久改掉缓存
         dirty.getVars().put("table", "hacked");
         ((Map<String, Object>) dirty.getVars().get("dialects"))
-                .put("oracle", new java.util.LinkedHashMap<>());
+                .put("oracle", new LinkedHashMap<>());
         dirty.node("acquire").getConfig().put("key", "hacked");
         ((Map<String, Object>) dirty.node("acquire").getConfig().get("nested")).put("deep", 999);
         dirty.getListeners().get(0).getConfig().put("level", "hacked");
         dirty.getRollbackListeners().get(0).getConfig().put("password", "明文口令");
         dirty.getGlobalNodeListeners().get(0).getConfig().put("gk", "hacked");
         dirty.node("migrate").getActions().get(0).getConfig().put("c", "hacked");
-        dirty.node("migrate").getActions().add(new com.tesla.ities.process.core.define.ActionDef());
+        dirty.node("migrate").getActions().add(new ActionDef());
         dirty.getNodes().remove("checkB");
         dirty.setFlow("evil");
         dirty.setErrorPolicy("fail_fast");
@@ -185,7 +202,6 @@ public class DefinitionCopyTest {
 
     @Test
     public void copyKeepsDeclarationTypesAndTopology() {
-        DefinitionCache cache = cacheCounting(new AtomicInteger());
         ProcessDefinition d = cache.definition("copy-test", 1);
 
         // 标量类型保真(String/Integer/Double/Boolean 原样回来; 裸日期不在保证范围内, 见 DefinitionCache 类注释)
@@ -217,27 +233,19 @@ public class DefinitionCopyTest {
         Assert.assertEquals("取锁", d.node("acquire").getName());
     }
 
+    /** 新版本天然是新条目(不需要失效入口): 两个版本各查各的, 互不覆盖。 */
     @Test
     public void newVersionGetsItsOwnSnapshot() {
-        ProcessDefinitionEntity v1 = new ProcessDefinitionEntity();
-        v1.setProcessDefId("ver-test");
-        v1.setVersion(1);
-        v1.setDefinition("flow: a\nnodes:\n  a: { handler: h1 }");
-        ProcessDefinitionEntity v2 = new ProcessDefinitionEntity();
-        v2.setProcessDefId("ver-test");
-        v2.setVersion(2);
-        v2.setDefinition("flow: a,b\nnodes:\n  a: { handler: h1 }\n  b: { handler: h2 }");
-        ProcessDefinitionMapper defMapper = (ProcessDefinitionMapper) Proxy.newProxyInstance(
-                ProcessDefinitionMapper.class.getClassLoader(), new Class<?>[]{ProcessDefinitionMapper.class},
-                (p, meth, args) -> "find".equals(meth.getName())
-                        ? (Integer.valueOf(2).equals(args[1]) ? v2 : v1) : null);
-        ProcessInstMapper procMapper = (ProcessInstMapper) Proxy.newProxyInstance(
-                ProcessInstMapper.class.getClassLoader(), new Class<?>[]{ProcessInstMapper.class},
-                (p, meth, args) -> null);
-        DefinitionCache cache = new DefinitionCache(defMapper, procMapper, new DefinitionLoader());
+        ProcessDefinitionEntity v1 = defRow("ver-test", 1, "flow: a\nnodes:\n  a: { handler: h1 }");
+        ProcessDefinitionEntity v2 = defRow("ver-test", 2, "flow: a,b\nnodes:\n  a: { handler: h1 }\n  b: { handler: h2 }");
+        when(defMapper.find(eq("ver-test"), anyInt(), isNull()))
+                .thenAnswer(inv -> Integer.valueOf(2).equals(inv.<Integer>getArgument(1)) ? v2 : v1);
 
         Assert.assertEquals(1, cache.definition("ver-test", 1).roots().size());
         Assert.assertEquals("新版本天然新条目, 不需失效入口", 2, cache.definition("ver-test", 2).roots().size());
         Assert.assertEquals(1, cache.definition("ver-test", 1).roots().size());
+        // 每个版本各回库一次; 第三次借出命中快照(说明老版本没被新版本挤掉)
+        verify(defMapper, times(1)).find("ver-test", 1, null);
+        verify(defMapper, times(1)).find("ver-test", 2, null);
     }
 }

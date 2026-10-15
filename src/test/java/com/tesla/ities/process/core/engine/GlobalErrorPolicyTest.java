@@ -1,61 +1,86 @@
 package com.tesla.ities.process.core.engine;
 
 import com.tesla.ities.process.core.context.ProcessContext;
-import com.tesla.ities.process.core.define.DslParser;
 import com.tesla.ities.process.core.define.DefinitionLoader;
+import com.tesla.ities.process.core.define.DslParser;
 import com.tesla.ities.process.core.define.ProcessDefinition;
 import com.tesla.ities.process.core.model.ErrorPolicy;
 import com.tesla.ities.process.core.runtime.VariableResolver;
+import com.tesla.ities.process.core.spi.ShardResolverRegistry;
 import com.tesla.ities.process.domain.LaneEntity;
 import com.tesla.ities.process.domain.NodeInstEntity;
 import com.tesla.ities.process.domain.ProcessInstEntity;
+import com.tesla.ities.process.mapper.ActionInstMapper;
 import com.tesla.ities.process.mapper.LaneMapper;
 import com.tesla.ities.process.mapper.NodeInstMapper;
 import com.tesla.ities.process.util.IdGenerator;
 import org.junit.Assert;
+import org.junit.Before;
 import org.junit.Test;
+import org.junit.runner.RunWith;
+import org.mockito.InjectMocks;
+import org.mockito.Mock;
+import org.mockito.Spy;
+import org.mockito.junit.MockitoJUnitRunner;
 
-import java.lang.reflect.InvocationHandler;
-import java.lang.reflect.Proxy;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicInteger;
+
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.when;
 
 /**
  * 全局 errorPolicy(流程级声明, 节点未声明时回落)的生效回归:
- *  - 叶子行: LeafExprMaterializer 落**生效值**——节点自己声明优先, 未声明才用全局, 都没声明才是 FAIL_FAST;
+ *  - 叶子行: ActionKind 落**生效值**——节点自己声明优先, 未声明才用全局, 都没声明才是 FAIL_FAST;
  *  - 控制行(PARALLEL/IF): 无 NodeDef 可就近声明, 直接取全局(旧实现恒 FAIL_FAST, 全局策略一改就生效);
  *  - lane 行: 继承所属节点行的生效值, 所以全局策略天然覆盖分片;
  *  - 根序列: ExecutionEngine.driveRoots 的收敛**就近声明优先**(见 sequenceConvergencePrefersNearestDeclaration),
  *    这一项自己声明了 errorPolicy 就听它的, 没声明才回落全局(单值覆盖, 不像监听器链那样拼接)。
+ *
+ * 装配口径: 两份档案 {@code @InjectMocks}, mapper 一律 {@code @Mock} 且只把 insertIgnore 的行收进 {@link #sink}
+ * (落库什么不重要, 重要的是那一行的 error_policy 列); IdGenerator 也 {@code @Mock}, 只要求它给出的业务键
+ * 在本用例内不重复(lane 行要靠它挂父键)。
  */
+@RunWith(MockitoJUnitRunner.class)
 public class GlobalErrorPolicyTest {
 
-    /** 只关心 insertIgnore 落库的那一行: 捕获进 sink, 其余方法给个安全默认值。 */
-    private static InvocationHandler capturing(List<Object> sink) {
-        return (proxy, method, args) -> {
-            if ("insertIgnore".equals(method.getName())) {
-                sink.add(args[0]);
-                return 1;
-            }
-            Class<?> rt = method.getReturnType();
-            if (rt == int.class) {
-                return 0;
-            }
-            if (rt == long.class) {
-                return 0L;
-            }
-            return rt == boolean.class ? false : null;
-        };
-    }
+    /** insertIgnore 落库的行都收这儿, 逐条用例只看自己那一条。 */
+    private final List<Object> sink = new ArrayList<>();
 
-    private static NodeInstMapper nodeMapper(List<Object> sink) {
-        return (NodeInstMapper) Proxy.newProxyInstance(NodeInstMapper.class.getClassLoader(),
-                new Class<?>[]{NodeInstMapper.class}, capturing(sink));
-    }
+    /** 替身号源: 每次取号给一个本用例内唯一的键。 */
+    private final AtomicInteger keySeq = new AtomicInteger();
 
-    private static LaneMapper laneMapper(List<Object> sink) {
-        return (LaneMapper) Proxy.newProxyInstance(LaneMapper.class.getClassLoader(),
-                new Class<?>[]{LaneMapper.class}, capturing(sink));
+    @Mock
+    private NodeInstMapper nodeMapper;
+    @Mock
+    private LaneMapper laneMapper;
+    @Mock
+    private ActionInstMapper actionMapper;
+    @Mock
+    private ShardResolverRegistry shardRegistry;
+    @Mock
+    private IdGenerator ids;
+    /** 物化要走 PLAN 冻结, 真身即可(零状态, 只吃传入的 resolver)。 */
+    @Spy
+    private ConfigFreeze freeze = new ConfigFreeze();
+
+    @InjectMocks
+    private ActionKind actionKind;
+    @InjectMocks
+    private ParallelKind parallelKind;
+
+    @Before
+    public void captureInsertedRows() {
+        when(ids.next(any())).thenAnswer(inv -> "K" + keySeq.incrementAndGet());
+        when(nodeMapper.insertIgnore(any())).thenAnswer(inv -> {
+            sink.add(inv.getArgument(0));
+            return 1;
+        });
+        when(laneMapper.insertIgnore(any())).thenAnswer(inv -> {
+            sink.add(inv.getArgument(0));
+            return 1;
+        });
     }
 
     private static DriveContext dc(String yaml) {
@@ -66,18 +91,16 @@ public class GlobalErrorPolicyTest {
     }
 
     /** 物化一个叶子节点, 返回落库行(只看它自己: 物化只建 node 行, lane/action 驱动期建)。 */
-    private static NodeInstEntity materializeLeaf(DriveContext dc, String nodeRef) {
-        List<Object> sink = new ArrayList<>();
-        new LeafExprMaterializer(nodeMapper(sink), null, null, null, new IdGenerator())
-                .materialize(null, dc, new DslParser.Leaf(nodeRef), null, false);
+    private NodeInstEntity materializeLeaf(DriveContext dc, String nodeRef) {
+        sink.clear();
+        actionKind.materialize(dc, new DslParser.Leaf(nodeRef), null);
         Assert.assertEquals(1, sink.size());
         return (NodeInstEntity) sink.get(0);
     }
 
-    private static NodeInstEntity materializeParallel(DriveContext dc) {
-        List<Object> sink = new ArrayList<>();
-        new ParallelExprMaterializer(nodeMapper(sink), new IdGenerator())
-                .materialize(null, dc, new DslParser.Parallel(), null, false);
+    private NodeInstEntity materializeParallel(DriveContext dc) {
+        sink.clear();
+        parallelKind.materialize(dc, new DslParser.Parallel(), null);
         Assert.assertEquals(1, sink.size());
         return (NodeInstEntity) sink.get(0);
     }
@@ -126,9 +149,8 @@ public class GlobalErrorPolicyTest {
                 + "nodes:\n  sharded:\n    handler: h\n    shard: dbTopology\n");
         NodeInstEntity node = materializeLeaf(dc, "sharded");
 
-        List<Object> sink = new ArrayList<>();
-        LeafExprMaterializer mat = new LeafExprMaterializer(nodeMapper(sink), laneMapper(sink), null, null, new IdGenerator());
-        LaneEntity lane = mat.laneAt(dc, node, "db1:3306");
+        sink.clear();
+        LaneEntity lane = actionKind.laneAt(dc, node, "db1:3306");
         Assert.assertEquals("只建了 lane 行", 1, sink.size());
         Assert.assertSame(lane, sink.get(0));
         Assert.assertEquals(ErrorPolicy.CONTINUE_ON_ERROR.getStatus(), lane.getErrorPolicy());

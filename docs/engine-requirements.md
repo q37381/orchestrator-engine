@@ -59,7 +59,7 @@
 | SnakeYAML | 2.x | 定义解析 | **必须**用 `SafeConstructor(LoaderOptions)`（2.0 起无参构造已删除）；**必须**显式放宽 `codePointLimit`（8MB）以容纳大定义 |
 | Jackson | 2.1x | JSON 桶、定义快照 | 派生方法**必须** `@JsonIgnore`（见 FR-LOAD-08） |
 | SLF4J | 1.7.x | 日志门面 | 引擎只依赖 API，实现由宿主提供 |
-| H2 / JUnit4 / Mockito | test | 测试 | **必须**不起 Spring 容器（见 NFR-TEST-01） |
+| JUnit4 / Mockito | test | 测试 | **必须**不起 Spring 容器（见 NFR-TEST-01）；**禁止**引内存库驱动（宿主环境只有 MySQL 驱动） |
 
 ### 2.4 明确不做（避免生成出不需要的东西）
 
@@ -297,15 +297,15 @@ nodes:
 | FR-EXE-01 | `start(procInstId)` **必须**先做前置判定再 CAS 认领（`pending → running`）：行不存在/已非 pending/被别的 owner 抢先，一律**不抛异常、不造假状态**，把当下读到的状态随返回值给出（行不存在＝`null`） |
 | FR-EXE-02 | 驱动骨架**必须**是：认领 → 建 `DriveContext`（live ProcessContext + 定义 + 无状态解析器/求值器 + baseVars）→ 挂定义到上下文 → 全局 Observer.before → 流程级 Listener.before（可否决）→ 顶层走查 → 收尾落终态 + Listener.after + Observer.after → 按需自动回退 |
 | FR-EXE-03 | 顶层走查序**必须**是 `setup → flow → setdown` 的拼接（`orderedRoots()`）：行与表达式按下标对齐；`setup`/`flow` 段索引区间为 `[0, setupSize)` 与 `[setupSize, setupSize+roots().size())` |
-| FR-EXE-04 | `setdown` 段**必须**无论成败都执行（清理锁/回写状态），且其结果**必须**参与终态聚合 |
+| FR-EXE-04 | `setdown` 段**必须**无论成败都执行（清理锁/回写状态），且其结果**必须**参与终态聚合（**handler 让渡除外**：让渡轮收尾段不跑，重入续跑完成后再收尾，见 5.23） |
 | FR-EXE-05 | 根序列的收敛判定**必须**只看**本根那一条**状态（`driveNode` 返回值），**不得**用聚合值判：聚合值会带上更早那次的坏，用它判会把没吭声的后续根一起误杀 |
 | FR-EXE-06 | 定义装载失败发生在 `DriveContext` 建成之前（无桶可脏刷）：引擎**必须**直接读写流程行，把一句因由写进 `result.__error` 并 CAS 翻 `failed`，**不发监听器**；绝不允许流程僵在 running 且查不到原因 |
-| FR-EXE-07 | 节点驱动**必须**分两档：行已是终态 → 幂等直接返回原终态（不触发监听器/策略）；未执行 → `markRunning` → Observer.before → NodeListener.before（可否决）→ 策略分发 → 收尾落终态 + NodeListener.after |
+| FR-EXE-07 | 节点驱动**必须**分两档：行已是终态 → 幂等直接返回原终态（不触发监听器/类型档案）；未执行 → `markRunning` → Observer.before → NodeListener.before（可否决）→ 按行上类型分发给对应档案 → 收尾落终态 + NodeListener.after |
 | FR-EXE-08 | 串行 action 序列**必须**"执行到第 i 个才建第 i 个"（LAZY 缺行补建；EAGER/重入命中已存在行），内联跑；`FAIL_FAST` 遇坏即停并 drain 后续已物化行。**并行** action 序列**必须**先补齐全部行再扇出（扇出需同时在） |
 | FR-EXE-09 | action 执行流水**必须**是：重建 payload → 建 `ActionContext` → 摘掉上一轮 `__error`/`__skipReason`/`__unresolved` → ACTIVATION 解析 config → 检出残留占位符（warn + 记 `__unresolved`）→ `when` guard → Observer.before → Listener.before → `handler.handle` → 落终态 + result → 脏刷流程级桶 → Listener.after → Observer.after |
 | FR-EXE-10 | 收尾落终态**必须**用 CAS（`running → 终态`）：被人工 `stop`/`pause` 抢先翻走时，**必须以 DB 为真值**重读并返回实际状态，不得覆盖人工干预 |
 | FR-EXE-11 | 流程级 `vars` 与 `result` **必须**由脏标记驱动落库：驱动中随时刷（每个 action 之后）、收尾再刷一次，因此 `after` 监听器写进流程级 result 的内容也能落住 |
-| FR-EXE-12 | `handler` 返回 `null` **必须**视为 `SUCCESS`；抛异常＝`FAILED`（异常摘要写 `result.__error`） |
+| FR-EXE-12 | `handler` 返回 `null` **必须**视为 `SUCCESS`；抛异常＝`FAILED`（异常摘要写 `result.__error`）；返回过程态 `pending`/`paused`/`suspended`＝**让渡**（退出驱动等重入，见 5.23）；返回 `running`/`created` 等其余非终态**必须**按 `FAILED` 处理并记 `__error` |
 
 ### 5.9 并发模型
 
@@ -408,7 +408,7 @@ nodes:
 | --- | --- |
 | FR-SPI-01 | 所有可插拔组件**必须**通过 `String name()` 路由（定义里写的是 name，不是 bean 名/类名）；实现类注册为 Spring Bean，注册表在构造期按 `name()` 收集 |
 | FR-SPI-02 | 注册**必须**在装配期查重并拒重复：同名 `ActionHandler`/四类 Listener 重复注册分别报 `AU204601/204603/204605/204607/204609`；未注册即调用报 `AU204602/204604/204606/204608/204610`，`ShardResolver` 未注册报 `AU204611` |
-| FR-SPI-03 | `ActionHandler.handle(ActionContext)` **必须**只返回 `Status`（收敛为无 `ActionResult`/无跳转指令）：要存结果就 `ctx.putResult/putVar`，要条件跳过就用声明式 `when`，**不得**在 handler 里做动态跳转 |
+| FR-SPI-03 | `ActionHandler.handle(ActionContext)` **必须**只返回 `Status`（收敛为无 `ActionResult`/无跳转指令）：要存结果就 `ctx.putResult/putVar`，要条件跳过就用声明式 `when`，**不得**在 handler 里做动态跳转；过程态返回值只允许 `pending`/`paused`/`suspended`（让渡，见 5.23） |
 | FR-SPI-04 | 执行契约是 **at-least-once**：`handle` **必须**幂等（重跑安全）。这条**必须**写进 SPI 注释与接入文档，因为重试/崩溃恢复都会重入 |
 | FR-SPI-05 | 补偿能力**必须**由 handler 自己声明：`compensable()` 默认 `false`，`compensate(ctx)` 默认空；不可补偿的步骤在回退时导致 `BLOCKED` |
 | FR-SPI-06 | 注册表**必须**容忍"集合注入为空"的装配场景：宿主一个 SPI 都没注册时，引擎装配不得失败；但依赖这些 Bean 的装配点（配置类里按类型集合注入处）**必须**有冒烟入口验证 |
@@ -417,16 +417,17 @@ nodes:
 
 ```
 created ──▶ pending ──▶ running ──▶ { success | failed | skipped | stopped }
-   ▲                        │        paused（流程级，可恢复）  suspended（预留，未落地）
-   └──── 干预复位 ──────────┘
+   ▲                        │        paused（流程级，可恢复）
+   │                        └──▶ pending / paused / suspended（handler 让渡：退出等重入，见 5.23）
+   └──── 干预复位 / 重入 ────┘
 ```
 
 | 编号 | 需求 |
 | --- | --- |
 | FR-STA-01 | 状态**必须**统一为一个枚举，携带**小写英文规范名**（落库/CAS/SQL 字面量一律小写）与 `severity`；反查一律用大小写不敏感的 `of(String)`，**禁止** `valueOf` |
-| FR-STA-02 | 聚合**必须**按 severity 取更差者：`FAILED(3) > STOPPED(2) > SUCCESS/SKIPPED(1) > 其余(0 不参与)`；`SKIPPED` 对流程与控制流等价于成功完成 |
-| FR-STA-03 | 分层状态口径**必须**是：`running` **只写在节点行**（`markRunning`）；action 行由 `created` 直接落终态；lane 行只落聚合终态；`PAUSED` 只在流程级存在；`SUSPENDED` 为预留未落地 |
-| FR-STA-04 | `driveNode` **必须**总是返回终态（内部所有分支都收敛到 `finishNode`） |
+| FR-STA-02 | 聚合**必须**按 severity 取更差者：`FAILED(3) > STOPPED(2) > SUCCESS/SKIPPED(1) > 其余(0 不参与)`；`SKIPPED` 对流程与控制流等价于成功完成。层模板聚合**必须**用让渡感知口径：坏终态(FAILED/STOPPED)优先 > 让渡 > severity（severity=0 的让渡态不得被吞成 SUCCESS，见 5.23） |
+| FR-STA-03 | 分层状态口径**必须**是：`running` **只写在节点行**（`markRunning`）；action 行由 `created` 直接落终态（**让渡例外**：可落 `pending`/`paused`/`suspended` 等重入，见 5.23）；lane 行只落聚合终态（让渡轮不落）；`PAUSED`/`SUSPENDED` 可作 handler 让渡返回的原值落流程行（`SUSPENDED` 停驻，无唤醒入口） |
+| FR-STA-04 | `driveNode` **必须**返回终态或让渡态（内部所有分支都收敛到 `finishNode`；handler 让渡时返回非终态，节点行停 `running`、不发 `nodeAfter`，见 5.23） |
 | FR-STA-05 | `CREATED` 与 `PENDING` **必须**语义分离：`created`＝已计划、不可认领（预插入初态）；`pending`＝已激活、等待认领 |
 
 ### 5.17 失败记录
@@ -506,6 +507,27 @@ created ──▶ pending ──▶ running ──▶ { success | failed | skipp
 | FR-SCH-04 | 无人值守认领**必须**不刷 `updator_id`（传 null 保留原值），驱动期再按流程创建人刷 |
 | FR-SCH-05 | node/lane/action 级认领（跨机并行）的 mapper 语句**必须**作为备用路径保留但默认不启用；`activate`（`created → pending`）等语义快捷**不得**被驱动主路径调用 |
 | FR-SCH-06 | 调度器**必须**可完全关闭（`dispatcherEnabled=false` 时只打一条日志不启线程），且**必须**以 `SmartInitializingSingleton` 在所有单例就绪后启动；线程为守护线程 |
+
+### 5.23 让渡（yield）与重入
+
+handler 返回过程态 = **让渡**：本轮立即退出驱动、状态落库等待重入。三档语义：
+
+| 返回值 | 流程行落 | 重入入口 |
+| --- | --- | --- |
+| `pending` | `pending` | Dispatcher 轮询自动重捞（节奏＝调度轮询间隔；v1 不做延迟列，防空转由 handler 自查外部作业状态承担） |
+| `paused` | `paused` | 现有 `resume`（paused → pending）或重试 |
+| `suspended` | `suspended` | 停驻：本期不做唤醒入口（重试也翻不动，按需再扩） |
+
+| 编号 | 需求 |
+| --- | --- |
+| FR-YLD-01 | 允许让渡的返回值**必须**只有 `pending`/`paused`/`suspended`；`running`/`created` 等其余非终态**必须**按 `FAILED` 处理（记 `__error` + warn 日志明示非法返回值），不得静默落库；驱动/聚合边界（层模板读取驱动返回值处）**必须**同口径兜底归一为 `FAILED`，且归一触发时**必须**留痕（warn 日志 + 流程级失败摘要，最终落 `process_inst.result.__error` 可见）——非法值既不得当让渡保持、也不得被 severity 聚合吞成成功 |
+| FR-YLD-02 | 让渡**必须**立即短路退出：段内剩余项不跑且**不 drain**（留给重入续跑，drain 掉就再也补不回来）；后续段一律不跑（setup 让渡→主段+setdown 不跑；main 让渡→setdown 不跑；顶层 flow 让渡→顶层 setdown 不跑） |
+| FR-YLD-03 | 让渡轮容器行**必须**不落终态：节点行停 `running`（`finishNode` 不写终态、不发 `nodeAfter`）、lane 行不动；流程行 CAS `running → 让渡态`，**不发** `processAfter`/Observer.after、**不触发** autoRollback |
+| FR-YLD-04 | 优先级**必须**是坏终态优先于让渡：本轮已出现 `FAILED`/`STOPPED` 时按现状坏终态收尾（不让渡）；层模板聚合一律用让渡感知口径（坏终态 > 让渡 > severity） |
+| FR-YLD-05 | 重入过滤**必须**是"终态行跳过（算 SUCCESS 计入聚合不重跑）、`created`/非终态行重跑"（at-least-once，handler 必须幂等）；让渡行重跑时 `visit_count` 照常递增 |
+| FR-YLD-06 | 并行档**必须**逐个 join 完再定终局（兄弟已提交不可撤回）：任一非终态保留为让渡态；让渡不触发 cancelPending（不是失败） |
+| FR-YLD-07 | 分片节点**必须**每 lane 独立回路：串行档让渡即停后续 lane；并行档 join 后判定；lane 间收敛与段内口径不变 |
+| FR-YLD-08 | action 级 `after` 监听器与 Observer.after **必须**照发（带让渡态）；节点级/流程级 after **不发**（未完成）；无 handler 返回过程态的流程路径**必须**逐字不变 |
 
 ---
 
@@ -608,7 +630,7 @@ created ──▶ pending ──▶ running ──▶ { success | failed | skipp
 | CF-05 | `tablePrefix`（配置类 setter） | `process_` | 8 张表一律随前缀；`""`＝裸表名逃逸 |
 | CF-06 | `dispatcherEnabled` / `dispatcherPollIntervalMs` / `dispatcherClaimBatch`（配置类 setter） | true / 500ms / 16 | 调度开关、轮询间隔、单轮认领上限 |
 | CF-07 | `dataSource`（配置类 setter） | null＝取上下文唯一/`@Primary` | 多源歧义时显式指定 |
-| CF-08 | 宿主**必须**（或可省略）提供 5 个 `StringSequenceGenerator` Bean，按 **Bean 名**注入：`processInstSequenceGenerator`、`nodeInstSequenceGenerator`、`laneSequenceGenerator`、`actionInstSequenceGenerator`、`rollbackRecordSequenceGenerator` | 缺则回落本地时间戳序列 | 引擎**不得**创建这些 Bean，也**不得**要求它们存在；缺失只打一条 WARN（列出还缺哪些名字）并继续启动 |
+| CF-08 | 宿主**必须**提供 5 个 `StringSequenceGenerator` Bean（那是个**接口**，引擎只要求无参 `getStringSequence()`；引擎自带的替身接口可整份删除），按 **Bean 名**注入：`processInstSequenceGenerator`、`nodeInstSequenceGenerator`、`laneSequenceGenerator`、`actionInstSequenceGenerator`、`rollbackRecordSequenceGenerator` | 缺则取号当场失败 | 引擎**不得**创建这些 Bean，也**不得**在启动期要求它们齐备（注入点 `required=false`）；但**不得**自造号——没绑上序列 Bean 就取不到号 |
 | CF-09 | Bean 名口径**必须**只在一处定义（`IdKind` 枚举的 5 行声明）；换名只改枚举或调 `setSequence(kind, generator)`，调用点一律不动 | — | 取号一律带种类：`ids.next(IdKind.NODE_INST)` |
 | CF-10 | 消费者**必须**可在同上下文声明同名 Bean 覆盖任一默认线程池 | — | 覆盖不需改引擎 |
 | CF-11 | 每档 sizing 的 `@Value` 默认值**必须**同时保留 Java 字段初始值，以兼容"非 Spring 直接 new 配置类"（单测/手工装配） | — | 两处数值必须一致 |
@@ -627,7 +649,7 @@ created ──▶ pending ──▶ running ──▶ { success | failed | skipp
 | EX-06 | 参数**必须**先一律转字符串再进 `MessageFormat`（否则 id/数量被 locale 加成千分位）；文案里**不得**出现单引号（`MessageFormat` 把 `'` 当转义符） |
 | EX-07 | `toString()` **必须**形如 `全类名[AU204302]: 文案`——异常类型统一后类名不再区分错误种类，全靠键查文案与按码统计 |
 | EX-08 | 宿主**必须**可整体替换文案源（`setResolver((key,args)->文本)`，返回 null 回落内置）；宿主已有同名异常类时，引擎那份**可以整份删除**，只要有这两个构造签名：`(String key, Object... args)`、`(String key, Throwable cause, Object... args)`，并满足 EX-07 |
-| EX-09 | 业务键取号**必须**当场拦截空值与超长（`AU204801`/`AU204802`，上限 20）：空业务键会落成一条查不到的死行，超长顶唯一索引列宽——不留到 SQL 报模糊错 |
+| EX-09 | 业务键取号**必须**只有一个号源：该种类没绑上序列 Bean 就**当场抛** `AU204801`（文案带上缺的 Bean 名），**不得**回落本地时间戳之类的自造号（那种号在多实例部署下不唯一，且会把"设施没接上"掩盖成"跑得好好的"）；号值的格式/长度由宿主序列负责，引擎不拦不改写 |
 
 ---
 
@@ -645,8 +667,9 @@ created ──▶ pending ──▶ running ──▶ { success | failed | skipp
 | NFR-08 | **性能量级**：定义借出为一次 Jackson 反序列化（典型亚毫秒）；取消闸门每 action/lane/子节点一次主键 `findById`（这些路径本就读写同一行，不引入额外往返）；单流程节点数量级到千、action 数量级到万时按下标对齐的查询仍走索引 |
 | NFR-09 | **资源**：线程池三档默认 16/16 + 2 万队列；关停**必须**等待在跑任务完成（30s 上限）；Dispatcher 线程为守护线程 |
 | NFR-10 | **兼容性**：存量库若仍有枚举大写行（如 `FAIL_FAST`/`COMPENSATING`），`of()` 大小写不敏感可读出，但认领/比较的 SQL 字面量是小写——迁移**必须**提供 `LOWER()` 刷数据脚本 |
-| NFR-TEST-01 | 测试**必须**能在不起 Spring 容器、不依赖 DB 的前提下驱动端到端行为：用内存替身表（Mockito）+ 构造器逐个 new 装配夹具复现真实依赖图；mapper XML 的 SQL 级回归单独用内存 DB |
+| NFR-TEST-01 | 测试**必须**能在不起 Spring 容器、不连库的前提下驱动端到端行为：用内存替身表（Mockito）+ 构造器逐个 new 装配夹具复现真实依赖图；mapper XML 的语句级回归用**替身 JDBC**（DataSource/Connection/PreparedStatement/ResultSet 全替，上面跑真实 MyBatis 装载），**不得**依赖内存库驱动 |
 | NFR-TEST-02 | 构建**必须**在"陈旧 class"下不可信：CI/本地验证**必须**以 `clean test` 为准（陈旧 test-classes 既会假绿灯，也会跑出已删除的测试名） |
+| NFR-TEST-03 | 库语义（唯一键去重、CAS 命中行数、auto_id 顺序、列默认值）**不得**由单测声称——替身 JDBC 只回放用例编程的答案；这类断言**必须**改走目标库上的回归，或只验到“发出的 SQL 与绑值”为止 |
 | NFR-DOC-01 | 文档与示例 YAML 的每个属性、每个占位符写法、每条错误码**必须**能在代码里找到对应实现或被明确标注为预留；发现不一致**必须**记入 `GAP-*` 而不是静默保留 |
 
 ---
@@ -679,10 +702,10 @@ created ──▶ pending ──▶ running ──▶ { success | failed | skipp
 | GAP-07 | lane 级桶不持久化：`lane.result`/`lane.config` 列从不写入，分片内 `ctx.upward().putResult` 只在本次内存有效，崩溃重驱动即丢 | 要么补 lane 收尾脏写 `result`，要么在文档规定"分片内跨 action 交接走流程级 `vars` 或业务专表"。禁止保留"看起来能持久、实际不能"的中间态 |
 | GAP-08 | 节点级/泳道级桶是普通 `LinkedHashMap`：`laneExecution: PARALLEL` 时多个 lane 线程可并发写同一 `NodeContext.result`，收尾快照与写入无同步保护（只有 `ProcessContext` 加了锁） | 明确分层并发契约：要么容器桶写入纳入同步（与流程级同口径），要么硬性规定"并行 lane 禁止写节点桶，只写流程级 vars/各自 action 行"，并在作者文档给出 |
 | GAP-09 | `EAGER` + `FAIL_FAST` 下被 `cancel(false)` 的子孙行已预建，会永远停在 `created`（孤儿行），不影响终态但污染进度分母 | 保留现状但写明口径：`total/done` 以 action 行为分母，节点层孤儿行不算未完成；后续可对收敛序列补 drain 置 `stopped` |
-| GAP-10 | 业务键列宽三处口径不一：DDL `VARCHAR(32)`、门面注释"varchar(20)"、应用侧硬上限 20 | 统一为"应用侧上限 20，列宽 ≥20（保持 32 有余量即可）"，注释与 DDL 对齐 |
-| GAP-11 | `@ComponentScan` 含不存在的包 `com.tesla.ities.process.executor` | 删除残留包名，或补齐该包的装配职责 |
-| GAP-12 | 装配注释仍写"只扫 `com.orchestrator.mapper`"、"SQL 在 `mapper/orchestrator/*.xml`"、"7 张表"，实际是 `com.tesla.ities.process.mapper`、`META-INF/mapper/process/*.xml`、**8 张表**（含调度表） | 按 DM/CF 章口径刷新注释；表数量口径统一为"7 张业务表 + 1 张调度表 = 8 张，一律随 `tablePrefix`" |
-| GAP-13 | 各 Mapper 接口注释统一指向 `resources/mapper/orchestrator/*.xml`（旧路径），实际文件在 `resources/META-INF/mapper/process/` | 修正注释路径，避免排障时找不到 SQL |
+| GAP-10 | ~~业务键列宽三处口径不一~~ **已处置**：DDL 与各处注释统一为 `VARCHAR(32)`，应用侧不再限长（号值格式/长度由宿主序列负责，见 EX-09） | 统一为"列宽 32，引擎不拦格式"，注释与 DDL 对齐 |
+| GAP-11 | ~~`@ComponentScan` 含不存在的包 `com.tesla.ities.process.executor`~~ **已处置**：残留包名已删 | 删除残留包名 |
+| GAP-12 | ~~装配注释仍写"只扫 `com.orchestrator.mapper`"、"SQL 在 `mapper/orchestrator/*.xml`"、"7 张表"~~ **已处置**：按实际改为 `com.tesla.ities.process.mapper`、`META-INF/mapper/process/*.xml`，表数量口径统一为 **8 张**（7 业务表 + 1 调度表，一律随 `tablePrefix`） | 按 DM/CF 章口径刷新注释 |
+| GAP-13 | ~~各 Mapper 接口注释指向 `resources/mapper/orchestrator/*.xml`（旧路径）~~ **已处置**：六处注释统一指向 `resources/META-INF/mapper/process/` | 修正注释路径，避免排障时找不到 SQL |
 
 ---
 
@@ -724,7 +747,7 @@ created ──▶ pending ──▶ running ──▶ { success | failed | skipp
 | 单元 | 引擎件：`DispatcherTest`、`CancellationRegistryTest`、`ObserverEngineTest`、`RegistryTest`、`EngineDefensiveTest`、`NamedParallelTest`、`ErrorsTest`、`EntityTest`、`MapperDefaultsTest`、`MiscUnitTest`、`GapCoverageTest`、`ProcessEngineConfigTest`、`ProcessExceptionTest` | 5.9/5.15/5.17/7/8 |
 | 特性 | `GlobalErrorPolicyTest`、`GlobalListenerChainTest` | FR-LOAD-04/05/06、FR-LST |
 | 端到端 | `EngineHappyPathTest`、`EngineGroupFlowTest`、`EngineNamedParallelTest`、`EngineErrorRecordTest`、`EngineErrorRollbackTest`、`EngineInterventionTest`（共用内存表夹具） | AC-01～AC-15 |
-| 持久化 | `MapperBindingTest`（SQL 文本绑定）、`MapperCrudTest`（内存 DB 真 CRUD） | 第 6 章 |
+| 持久化 | `MapperBindingTest`（SQL 文本绑定）、`MapperCrudTest`（替身 JDBC 上的接线回归）、`MapperDefaultsTest`（default 快捷方法的委托） | 第 6 章 |
 
 **测试纪律**（与现状工程实践一致）：测试红灯先归因（区分存量红/新引入红）再动手；行为契约变更时**优先改测试以匹配新契约**，但生产语义与既有拍板决策冲突时以保留生产代码为准；断言必须与需求编号可对应。
 
@@ -741,10 +764,16 @@ com.tesla.ities.process
 ├─ core
 │  ├─ define  ProcessDefinition · NodeDef · ActionDef · ListenerDef · DslParser · DefinitionLoader
 │  ├─ context Context（基类，三桶+父链）· ProcessContext · NodeContext · LaneContext · ActionContext
-│  ├─ engine  ExecutionEngine · NodeDriver · Materializer + ExprMaterializer{Leaf,Parallel,If,Group} ·
-│  │          NodeStrategy{Action,Parallel,If,Group} · Dispatcher · DriveContext · ListenerEngine ·
+│  ├─ engine  ExecutionEngine · NodeDriver（仅节点生命周期，实现 NodeRecursion/CancellationGate）· ActionRunner
+│  │          （action 单项/序列生命周期，实现 ActionExecution）· ProcessStateFlusher（流程级脏桶）·
+│  │          Materializer（实现 ChildCursor）· ConfigFreeze（两相 config 解析）·
+│  │          NodeKind + NodeKinds（一种节点类型一份档案：{Action,Parallel,If,Group}Kind，物化与驱动同处归口）·
+│  │          NodeEnv（档案可见的四组角色接口分组）+ CancellationGate/NodeRecursion/ChildCursor/ActionRows/
+│  │          ActionExecution · SerialSequence（走查基类：串行 runRange + 扇出 fanout 两份模板，五个层类
+│  │          Root/Group/Parallel/Lane/ActionSequence）· Fanout · NodeGuard ·
+│  │          Dispatcher · DriveContext · ListenerEngine ·
 │  │          ObserverEngine · PlanService · InterventionService · RollbackService · ProgressService
-│  ├─ model   Status · NodeType · ErrorPolicy · DefinitionStatus · RollbackStatus · Scope
+│  ├─ model   Status · NodeType · ErrorPolicy · DefinitionStatus · RollbackStatus
 │  ├─ runtime VariableResolver · ConditionEvaluator · ContextFactory · DefinitionCache · CancellationRegistry
 │  └─ spi     ActionHandler · ShardResolver · ProcessListener · NodeListener · ActionListener ·
 │             RollbackListener · ProcessObserver ·（以上各一个 *Registry）
@@ -761,12 +790,13 @@ com.tesla.ities.process
 | --- | --- | --- |
 | `DslParser` | 文本 ↔ 表达式树、往返写回、语法级拒绝 | 读定义、碰 DB |
 | `DefinitionLoader` | YAML → 定义模型、聚合展开并重写 flow、命名成对校验 | 运行期判定、写实例表 |
-| `Materializer` 家族 | 表达式 → 实例行；按下标对齐并挂 transient 光标/定义/链 | 执行 handler、判策略 |
-| `NodeStrategy` 家族 | 一种节点类型的"怎么跑子树"；返回聚合终态 | 直接写节点行状态（收尾归 NodeDriver） |
-| `NodeDriver` | 节点/ action 序列驱动、guard、监听器、状态与 result 落库、流程级脏刷 | 递归回调引擎（避免环依赖） |
+| `Materializer` | 行 ↔ 表达式按下标对齐（rootAt/childAt/ensureRoots）、挂 transient 光标/定义/链、EAGER 时按档案声明递归 | 按类型细化判断、执行 handler、托管 config 解析（归 `ConfigFreeze`） |
+| `*Kind`（节点类型档案） | 一种 NodeType 的建行与"怎么跑子树"；返回聚合终态；本层序列的串/并行两档交 `SerialSequence` 层类自决（串行=runRange 模板，并行=扇出后 `Fanout` join）、guard 交 `NodeGuard` | 直接写节点行状态（收尾归 NodeDriver）、构造期反向依赖 Materializer/NodeDriver/ActionRunner、拿到实现类门面（只经 `NodeEnv` 的角色接口） |
+| `NodeDriver` | 节点生命周期：幂等跳过、markRunning、节点级监听器/观察者、按行 type 分发给档案、finishNode 落节点终态 | 跑 action（归 `ActionRunner`）、刷流程级脏桶（归 `ProcessStateFlusher`）、向层类转发档案方法（层类直接面向角色接口） |
+| `ActionRunner` | action 生命周期：序列协调（含 lane/node 状态收尾）、单项执行（激活期解析→guard→BEFORE→handler→持久化→AFTER）、drain 落行 | 递归驱动节点、分发类型档案 |
 | `ExecutionEngine` | 认领、顶层走查、流程级监听器、收尾终态、自动回退触发 | 持有本机取消状态、跨流程缓存 |
-| `*Service`（Plan/Intervention/Progress/Rollback） | 单向叶子：可被 engine/api 调用，**不**反向依赖引擎内部 | 被策略回调 |
-| `*Registry` | `name()` 路由 + 装配期查重 | 惰性注册、运行期改路由 |
+| `*Service`（Plan/Intervention/Progress/Rollback） | 单向叶子：可被 engine/api 调用，**不**反向依赖引擎内部 | 被类型档案回调 |
+| `*Registry` / `NodeKinds` | `name()` 路由 + 装配期查重（一种类型/一个表达式只一份档案） | 惰性注册、运行期改路由 |
 | Mapper/XML | SQL 与列映射 | Java 侧拼 SQL |
 
 ### 12.3 实现顺序（依赖驱动，可并行度标注）
@@ -775,7 +805,7 @@ com.tesla.ities.process
 2. `define`（先 `DslParser` 纯函数 + 单测，再 `DefinitionLoader`）。
 3. `domain` + `mapper` 接口 + XML + `schema.sql`（含表前缀变量），跑 `MapperBinding/MapperCrud`。
 4. `context`（基类三桶与上溯）→ `runtime`（解析器 → 求值器 → 工厂 → 缓存 → 取消闸门）。
-5. `engine`：`DriveContext` → `ExprMaterializer` 四个 → `Materializer` → `NodeStrategy` 四个 → `NodeDriver` → `ExecutionEngine` → `PlanService` → `InterventionService`/`RollbackService`/`ProgressService` → `Dispatcher`。
+5. `engine`：`DriveContext` → 角色接口（`CancellationGate`/`NodeRecursion`/`ChildCursor`/`ActionRows`/`ActionExecution`）与 `NodeEnv` → `NodeKind` 四份档案（{Action,Parallel,If,Group}Kind + `NodeKinds` 注册表；ActionKind 同时实现 `ActionRows`）→ `ConfigFreeze` → `Materializer` → `ActionRunner`/`ProcessStateFlusher` → `NodeDriver` → `ExecutionEngine` → `PlanService` → `InterventionService`/`RollbackService`/`ProgressService` → `Dispatcher`；共享骨架 `SerialSequence`（含 Root/Group/Parallel/Lane/ActionSequence 层类，串行 runRange 与扇出 fanout 各一份模板）/`Fanout`/`NodeGuard` 与档案同期落地。
 6. `spi` 接口 + `Registry`（可与 5 并行）。
 7. `api` 门面 + 语法糖 → `config` → `web`。
 8. 端到端夹具与 AC 套件。
@@ -898,34 +928,36 @@ nodes:
 | AU204212 | 并行命名后缀在 nodes 下无声明 | `validateNamedParallels` |
 | AU204213 | 容器形状的节点未被 flow 引用（死配置） | `validateNamedParallels` |
 | AU204214 | 非法 autoRollback 声明值 | `declaredSwitch` |
-| AU204301 | ACTION 节点行的走查表达式不是叶子 | `ActionStrategy` |
+| AU204301 | ACTION 节点行的走查表达式不是叶子 | `ActionKind.drive` |
 | AU204302 | flow 引用了未定义的节点 | 叶子物化 |
-| AU204303 | GROUP 行的走查表达式不是聚合表达式 | `GroupStrategy` |
-| AU204304 | 没有物化策略支持的表达式类型 | `Materializer` |
+| AU204303 | GROUP 行的走查表达式不是聚合表达式 | `GroupKind.drive` |
+| AU204304 | 没有类型档案认领的表达式类型 | `NodeKinds.ofExpr`（由 `Materializer` 分发） |
 | AU204305 | 节点行缺少走查光标（未经物化对齐） | `NodeDriver.driveNode` |
-| AU204306 | 没有驱动策略支持的节点类型 | `NodeDriver.driveNode` |
-| AU204307 | ACTION 行缺少对齐时挂载的节点定义 | `runActionSequence` |
+| AU204306 | 没有类型档案认领的节点类型（如预留的 WHILE） | `NodeKinds.ofType`（由 `NodeDriver.driveNode` 分发） |
+| AU204307 | ACTION 行缺少对齐时挂载的节点定义 | `ActionRunner.runActionSequence` |
 | AU204308 | 监听器声明缺少 name | `ListenerEngine` |
+| AU204309 | 一种节点类型被两份档案认领（装配期重复注册） | `NodeKinds` 构造期 |
+| AU204310 | IF 行的走查表达式不是条件表达式 | `IfKind.drive` |
 | AU204401 | 流程定义没有已发布版本 | `PlanService` |
 | AU204402 | 流程定义版本不存在 | `DefinitionCache` |
 | AU204501 | 非数值操作数不可比较大小 | `ConditionEvaluator` |
 | AU204601…204611 | SPI 重复注册 / 未注册（handler、四类 listener、shard resolver） | 各 `*Registry` |
 | AU204701…204704 | JSON 序列化/反序列化失败 | `Json` |
-| AU204801 / 204802 | 业务键取号为空 / 超长（上限 20） | `IdGenerator` |
+| AU204801 | 业务键序列未装配（该种类没绑上序列 Bean） | `IdGenerator` |
 
 ## 附录 C 需求 → 实现锚点（现行代码定位）
 
 | 需求段 | 锚点 |
 | --- | --- |
-| 5.2/5.3 DSL 语法与表达式 | `DslParser`、`ProcessDefinition.roots/orderedRoots/flowOrder` |
-| 5.4/5.5 聚合与命名并行 | `DefinitionLoader.expandGroups/validateNamedParallels`、`GroupExprMaterializer`、`ParallelExprMaterializer` |
+| 5.2/5.3 DSL 语法与表达式 | `DslParser`（`Expr.children/defRef/appendFlow` 类型自述）、`ProcessDefinition.roots/orderedRoots/flowOrder` |
+| 5.4/5.5 聚合与命名并行 | `DefinitionLoader.expandGroups/validateNamedParallels`、`GroupKind`、`ParallelKind` |
 | 5.6 装载与校验 | `DefinitionLoader`、`ProcessDefinition.mergeWithGlobals/effectiveErrorPolicy/stopsSequence` |
 | 5.7 创建 | `PlanService.createProcess` |
-| 5.8 执行 | `ExecutionEngine`、`NodeDriver`、`Materializer.rootAt/childAt/attachCursor` |
-| 5.9 并发 | `ProcessEngineConfig` 三池、`ParallelStrategy`、`ActionStrategy`、`runActionsParallel` |
+| 5.8 执行 | `ExecutionEngine`、`NodeDriver`（节点生命周期）、`ActionRunner`（action 生命周期）、`Materializer.rootAt/childAt/attachCursor` |
+| 5.9 并发 | `ProcessEngineConfig` 三池、`ParallelSequence`、`ActionKind`、`Fanout`、`SerialSequence.fanout` 扇出模板（`ActionSequence`/`LaneSequence` 的并行档共用） |
 | 5.10 上下文 | `Context`、`ProcessContext`、`NodeContext`、`LaneContext`、`ActionContext`、`ContextFactory` |
 | 5.11/5.12 变量与条件 | `VariableResolver`、`ConditionEvaluator` |
-| 5.13 分片 | `ShardResolver`、`LeafExprMaterializer.resolveShardKeys/laneAt` |
+| 5.13 分片 | `ShardResolver`、`ActionKind.resolveShardKeys/laneAt` |
 | 5.14/5.15 扩展点 | `ListenerEngine`、`ObserverEngine`、`core.spi.*` |
 | 5.16/5.17 状态与失败 | `Status`、`Errors`、`ProcessContext.recordFailure/settleFailure` |
 | 5.18/5.19 干预与回退 | `InterventionService`、`RollbackService`、`CancellationRegistry`、`ExecutionEngine.autoRollback` |

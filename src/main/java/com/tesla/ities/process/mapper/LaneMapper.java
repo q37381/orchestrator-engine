@@ -8,7 +8,7 @@ import org.apache.ibatis.annotations.Param;
 import java.util.List;
 
 /**
- * lane 数据访问。SQL 见 resources/mapper/orchestrator/LaneMapper.xml。
+ * lane 数据访问。SQL 见 resources/META-INF/mapper/process/LaneMapper.xml。
  *
  * 精简说明: findByNode / findByNodeAndShard 只差"是否按 shard_key 收窄", 合并为 {@link #findByNode};
  * setStatus / casStatus / activate / updateStatusResult / updateResult 合并为一条动态 {@link #updateState}。

@@ -30,7 +30,10 @@ public class NodeDef {
     private String condition;                  // IF 条件(沿用列, 预留)
     private String errorPolicy;                // FAIL_FAST|CONTINUE_ON_ERROR; 未声明则回落流程级全局 errorPolicy, 都没声明才是 FAIL_FAST
     private Map<String, Object> config = new LinkedHashMap<>();
-    private List<ActionDef> actions;           // 节点内多 action
+    private List<ActionDef> actions;           // 节点内多 action(主段)
+    private List<ActionDef> setup;             // 前置段(回路内, 主段之前逐项执行; 段坏则跳过主段); 与 actions 同构解析
+    private List<ActionDef> setdown;           // 收尾段(回路内, finally 语义: 恒执行/段内不收敛); 与 actions 同构解析
+    private String repeatSegments;             // 段重复执行开关(true/false 归一化文本, v1.1); 未声明 = null(走成对重臂默认语义)
     private List<ListenerDef> listeners;       // 节点级监听器(NodeListener)
 
     public String getId() {
@@ -99,6 +102,24 @@ public class NodeDef {
     public void setActions(List<ActionDef> v) {
         this.actions = v;
     }
+    public List<ActionDef> getSetup() {
+        return setup;
+    }
+    public void setSetup(List<ActionDef> v) {
+        this.setup = v;
+    }
+    public List<ActionDef> getSetdown() {
+        return setdown;
+    }
+    public void setSetdown(List<ActionDef> v) {
+        this.setdown = v;
+    }
+    public String getRepeatSegments() {
+        return repeatSegments;
+    }
+    public void setRepeatSegments(String v) {
+        this.repeatSegments = v;
+    }
     public List<ListenerDef> getListeners() {
         return listeners;
     }
@@ -118,6 +139,12 @@ public class NodeDef {
     @JsonIgnore
     public boolean isActionParallel() {
         return "PARALLEL".equalsIgnoreCase(actionExecution);
+    }
+
+    /** 段重复执行开关是否开启(v1.1 派生视图, 非属性): 声明值算出 true 才算开; 未声明按关闭算(拼错的装载期已拒)。 */
+    @JsonIgnore
+    public boolean repeatSegmentsEnabled() {
+        return Boolean.TRUE.equals(ProcessDefinition.parseSwitch(repeatSegments));
     }
 
     /** 展示名: 声明了 name 用 name, 否则回落定义 id(两者都空时返回 null, 由调用方再回落实例键)。 */

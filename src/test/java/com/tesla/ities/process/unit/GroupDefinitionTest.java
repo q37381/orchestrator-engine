@@ -7,6 +7,9 @@ import com.tesla.ities.process.util.Json;
 import com.tesla.ities.process.exception.ProcessException;
 import org.junit.Assert;
 import org.junit.Test;
+import org.junit.runner.RunWith;
+import org.mockito.InjectMocks;
+import org.mockito.junit.MockitoJUnitRunner;
 
 import java.util.List;
 
@@ -16,8 +19,14 @@ import java.util.List;
  * 为什么单独立一个类盯这条: DefinitionCache 存的是定义 JSON 快照, ProcessDefinition.roots 是 transient,
  * 借出的副本各自按 flow 字符串重解析 DSL。展开结果若只放内存, 副本就会退回未展开状态,
  * 驱动期报"flow 引用了未定义节点"——所以 {@link #snapshotRoundTripKeepsExpansion} 是本类的核心用例。
+ *
+ * 装载器无协作者(纯 YAML/DSL 解析), 按 {@code @InjectMocks} 口径由 Mockito 造; 断言全在定义层, 不需要替身。
  */
+@RunWith(MockitoJUnitRunner.class)
 public class GroupDefinitionTest {
+
+    @InjectMocks
+    private DefinitionLoader loader;
 
     private static final String SPACE_CHECK =
             "flow: \"spaceCheck,summary\"\n"
@@ -44,7 +53,7 @@ public class GroupDefinitionTest {
           + "    handler: ok\n";
 
     private ProcessDefinition load(String yaml) {
-        return new DefinitionLoader().load(yaml);
+        return loader.load(yaml);
     }
 
     // ===================== 展开形状 =====================

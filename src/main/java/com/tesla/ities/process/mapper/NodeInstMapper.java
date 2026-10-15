@@ -8,7 +8,7 @@ import org.apache.ibatis.annotations.Param;
 import java.util.List;
 
 /**
- * node_inst 数据访问。SQL 见 resources/mapper/orchestrator/NodeInstMapper.xml。
+ * node_inst 数据访问。SQL 见 resources/META-INF/mapper/process/NodeInstMapper.xml。
  *
  * 精简说明:
  *  - findRoots / findChildren 只差"parent_id IS NULL 还是等于某值", 合并为 {@link #findByParent};

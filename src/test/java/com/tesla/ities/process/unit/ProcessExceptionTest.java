@@ -4,6 +4,8 @@ import com.tesla.ities.process.exception.ProcessException;
 import com.tesla.ities.process.util.Errors;
 import org.junit.Assert;
 import org.junit.Test;
+import org.junit.runner.RunWith;
+import org.mockito.junit.MockitoJUnitRunner;
 
 import java.util.Locale;
 
@@ -12,7 +14,11 @@ import java.util.Locale;
  *
  * 这里刻意按**键**断言而不是按中文断言: 文案是可改的展示层, 键才是调用方与日志检索的契约。
  * 只有个别处直接断中文(如 {@link #keyResolvesChineseTextFromBundle}), 用来证明 bundle 真被读到了。
+ *
+ * 异常自己就是被测对象(无协作者), 所以本类只用统一的 {@code MockitoJUnitRunner} 口径跑;
+ * 换文案源那几处传的是 {@code setResolver} 的入参(lambda 即该 API 的正常用法), 不是测试替身。
  */
+@RunWith(MockitoJUnitRunner.class)
 public class ProcessExceptionTest {
 
     /** 主干在用的全部消息键 —— 新增抛出点必须同时补 bundle, 这条用例就是那道闸。 */
@@ -21,12 +27,13 @@ public class ProcessExceptionTest {
             "AU204101", "AU204102", "AU204103", "AU204104", "AU204105", "AU204106", "AU204107", "AU204108", "AU204109", "AU204110",
             "AU204201", "AU204202", "AU204203", "AU204204", "AU204205", "AU204206", "AU204207",
             "AU204208", "AU204209", "AU204210", "AU204211", "AU204212", "AU204213", "AU204214",
-            "AU204301", "AU204302", "AU204303", "AU204304", "AU204305", "AU204306", "AU204307", "AU204308",
+            "AU204301", "AU204302", "AU204303", "AU204304", "AU204305", "AU204306", "AU204307", "AU204308", "AU204309", "AU204310",
             "AU204401", "AU204402",
             "AU204501",
             "AU204601", "AU204602", "AU204603", "AU204604", "AU204605", "AU204606",
             "AU204607", "AU204608", "AU204609", "AU204610", "AU204611",
             "AU204701", "AU204702", "AU204703", "AU204704",
+            "AU204801",
     };
 
     @Test

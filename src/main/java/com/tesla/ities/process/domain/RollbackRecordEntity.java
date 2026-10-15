@@ -3,16 +3,16 @@ package com.tesla.ities.process.domain;
 import java.time.LocalDateTime;
 
 /**
- * rollback_record 行(持久化实体): 回退/补偿的独立可追溯历史(#16)。
- * 关联原 action_inst(不改其状态), 每个补偿步骤一行。detail 以 JSON 文本存补充信息。
+ * rollback_record 行(持久化实体): 回退/补偿 + 向前重放的独立可追溯历史(#16)。
+ * 关联原 action_inst(不改其状态), 每个补偿/重放步骤一行。detail 以 JSON 文本存补充信息。
  */
 public class RollbackRecordEntity {
     private Long autoId;            // 物理主键
-    private String rollbackId;      // 业务键 varchar(20)
+    private String rollbackId;      // 业务键 varchar(32)
     private String procInstId;      // 所属流程业务键
     private String actionInstId;    // 关联的原 action 业务键
     private String actionDefId;
-    private String status;          // COMPENSATING|COMPENSATED|COMPENSATE_FAILED|BLOCKED
+    private String status;          // RollbackStatus.getStatus() 小写: compensating|compensated|compensate_failed|blocked|restoring|restored|restore_failed
     private String operator;
     private String detail;          // JSON 文本: reason/异常信息等
     private String creatorId;       // 创建用户(发起回退的操作人) varchar(20)

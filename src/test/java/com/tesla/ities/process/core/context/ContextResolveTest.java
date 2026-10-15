@@ -4,18 +4,33 @@ import com.tesla.ities.process.core.define.DefinitionLoader;
 import com.tesla.ities.process.core.define.NodeDef;
 import com.tesla.ities.process.core.define.ProcessDefinition;
 import com.tesla.ities.process.core.runtime.ContextFactory;
+import com.tesla.ities.process.core.spi.ShardResolverRegistry;
 import com.tesla.ities.process.domain.NodeInstEntity;
 import com.tesla.ities.process.domain.ProcessInstEntity;
 import org.junit.Assert;
 import org.junit.Test;
+import org.junit.runner.RunWith;
+import org.mockito.InjectMocks;
+import org.mockito.Mock;
+import org.mockito.junit.MockitoJUnitRunner;
 
 /**
  * 上下文读法的两档口径: getXxx(key)/get(key) 只读本层(平铺键, 不上溯不下钻);
  * resolveXxx(key) 首段命中则桶内下钻、否则逐级上溯。整桶只有 config()/params()/result()。
  * 全部按 key 的读法返回泛型 T(调用方不强转); userId()/vars 与 putVar 同族: 任意层上溯到流程。
  * 分片解析不再包专用载体: ShardResolver 直接收本节点的 NodeContext。
+ *
+ * 装配口径: 上下文工厂 {@code @InjectMocks}(分片注册表是 @Mock —— 本类只走不碰它的 process/node/buildPayload
+ * 空值分支), 上下文与实例行都是真实对象: 被测的正是它们自己的桶语义。
  */
+@RunWith(MockitoJUnitRunner.class)
 public class ContextResolveTest {
+
+    @Mock
+    private ShardResolverRegistry shardRegistry;
+
+    @InjectMocks
+    private ContextFactory factory;
 
     /** 造一个节点上下文: NodeContext 直接带实例行(此处行只装业务键, 不带定义)。 */
     private static NodeContext nodeCtx(ProcessContext parent, String nodeInstId) {
@@ -109,7 +124,7 @@ public class ContextResolveTest {
         pi.setProcInstId("P1");
         pi.setVars("{\"dialect\":null,\"table\":\"t1\",\"nested\":{\"a\":null}}");   // 顶层空值 + 嵌套空值
 
-        ProcessContext p = new ContextFactory(null).process(pi);        // 重建上下文不能因空值报 NPE
+        ProcessContext p = factory.process(pi);        // 重建上下文不能因空值报 NPE
         Assert.assertEquals("t1", p.getVar("table"));
         Assert.assertNull("空值键被跳过(等于没这个变量)", p.<Object>getVar("dialect"));
         Assert.assertTrue("嵌套 map 本身非 null, 照常装", p.vars().containsKey("nested"));
@@ -131,7 +146,7 @@ public class ContextResolveTest {
         pi.setProcInstId("P1");
         pi.setResult("{\"check\":{\"rows\":5}}");
 
-        ProcessContext p = new ContextFactory(null).process(pi);
+        ProcessContext p = factory.process(pi);
         Object rows = p.resolveResult("check.rows");             // 已落库的流程级 result 重建后照常上溯可读
         Assert.assertEquals(5, rows);
         Assert.assertFalse("重建不算脏写", p.isResultDirty());
@@ -188,8 +203,7 @@ public class ContextResolveTest {
         Assert.assertEquals("id 仍是 map 键(引用键不受改名影响)", "migrateData", def.node("migrateData").getId());
         Assert.assertEquals("未声明 name 回落 id", "postCheck", def.node("postCheck").displayName());
 
-        // node() 不碰分片注册表, 因此可传 null registry 直接测上下文构建
-        ContextFactory factory = new ContextFactory(null);
+        // node() 不碰分片注册表(@Mock 的那份只在 buildPayload 命中 resolver 时才用), 直接测上下文构建
         ProcessContext p = new ProcessContext("P1");
 
         NodeInstEntity leaf = new NodeInstEntity();
@@ -235,7 +249,6 @@ public class ContextResolveTest {
         leaf.setConfig("{\"endpoints\":[{\"host\":\"h1\",\"port\":3306}]}");   // 物化后落库的节点级 config
 
         // node()/process() 均由工厂从行重建(无需再读 JSON); params 桶无持久化来源
-        ContextFactory factory = new ContextFactory(null);
         NodeContext ctx = factory.node(factory.process(pi), leaf);
 
         java.util.List<?> nodeEps = ctx.resolveConfig("endpoints");    // 节点级优先(innermost 胜, 泛型直接接 List)

@@ -8,6 +8,8 @@ import com.tesla.ities.process.domain.ProcessInstEntity;
 import com.tesla.ities.process.domain.RollbackRecordEntity;
 import org.junit.Assert;
 import org.junit.Test;
+import org.junit.runner.RunWith;
+import org.mockito.junit.MockitoJUnitRunner;
 
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
@@ -18,7 +20,10 @@ import java.util.List;
 /**
  * 持久化实体 POJO 契约: 每个字段都能经 setX/getX 往返(含时间/布尔/整型/字符串/对象/transient)。
  * 用反射逐字段遍历, 一处覆盖所有 getter/setter, 不随字段增减而漏测。
+ *
+ * 实体没有协作者(纯 POJO), 因此本类只用统一的 {@code MockitoJUnitRunner} 口径跑, 不涉及 @Mock/@InjectMocks。
  */
+@RunWith(MockitoJUnitRunner.class)
 public class EntityTest {
 
     private static final List<Class<?>> ENTITIES = Arrays.asList(

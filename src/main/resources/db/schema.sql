@@ -10,18 +10,18 @@
 --
 -- 主键约定(本版改造):
 --   每表 auto_id BIGINT AUTO_INCREMENT 为物理主键, 应用不直接使用;
---   原业务 id 列(*_id)改 VARCHAR(20), 由应用生成(IdGenerator: 每类业务键各一个序列号生成器 Bean), 降为唯一索引;
+--   原业务 id 列(*_id)改 VARCHAR(32), 由应用生成(IdGenerator: 每类业务键各一个序列号生成器 Bean), 降为唯一索引;
 --   action_inst / node_inst 的声明顺序由 auto_id 升序承载。
---   表间外键一律用 VARCHAR(20) 业务键。
+--   表间外键一律用 VARCHAR(32) 业务键。
 --
--- 表命名空间(嵌入式组件不假设裸表名可用): 7 张表统一 process_ 前缀
+-- 表命名空间(嵌入式组件不假设裸表名可用): 8 张表统一 process_ 前缀
 --   (process_definition / process_inst / process_node_inst / process_lane /
---    process_action_inst / process_rollback_record / process_fragment);
+--    process_action_inst / process_rollback_record / process_fragment / process_sched);
 --   列名与索引名不加前缀(MySQL 索引名仅表内唯一)。消费者撞名时改
 --   ProcessEngineConfig.tablePrefix, mapper XML 经 ${orch.table.*} 变量整体换名:
---   7 张**一律** = 前缀 + 表名, 上表名字里的 "process" 就是默认前缀本身, 没有两张固定名特权。
+--   8 张**一律** = 前缀 + 表名, 上表名字里的 "process" 就是默认前缀本身, 没有两张固定名特权。
 --
--- 审计列(每表统一): creator_id / updator_id VARCHAR(20) —— 用户身份, 与业务键同宽;
+-- 审计列(每表统一): creator_id / updator_id VARCHAR(20) —— 用户身份(比业务键窄一档);
 --   creator_id = 建行时写流程创建人(创建流程时由调用方传入 userId, 落 process_inst.creator_id 并进 ProcessContext.userId;
 --     各级实例行由物化器取同一值, 所以驱动线程/子线程在哪建行都不影响归属);
 --   updator_id = 每次 UPDATE 由调用方从上下文显式下传(驱动期 = 流程创建人, 干预期 = 操作人);
@@ -122,7 +122,6 @@ CREATE TABLE process_node_inst (
   type           VARCHAR(16)  NOT NULL COMMENT 'NodeType.getStatus() 小写: parallel|if|group|action(控制/叶子由 type 区分; node_path/kind 已移除)',
   parent_id      VARCHAR(32)  COMMENT '父节点业务键, 顶层根为 NULL',
   status         VARCHAR(16)  NOT NULL DEFAULT 'created',
-  pending        INT          COMMENT 'join 计数(记录用); NULL=未激活',
   error_policy   VARCHAR(24)  NOT NULL DEFAULT 'fail_fast' COMMENT '生效值(物化期冻结, ErrorPolicy.getStatus() 小写): 节点声明 > 流程级全局 errorPolicy > 默认 FAIL_FAST',
   shard_enabled  TINYINT      NOT NULL DEFAULT 0,
   shard_resolver VARCHAR(64)  COMMENT 'ShardResolver.name()',
@@ -159,6 +158,15 @@ CREATE TABLE process_lane (
   KEY idx_proc (proc_inst_id, status)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+-- segment 列(段特性): 动作在节点回路内的执行段 —— setup(主段之前)/main(主段)/setdown(收尾, finally);
+--   v1.2 追加 action 级段两值: action-setup(主体动作之前)/action-setdown(主体动作之后, finally) —— 独立段值使存量回路查询天然看不到段行。
+-- 存量库升级(逐条执行, 老行自动落默认值 main, 口径不变):
+--   ALTER TABLE process_action_inst ADD COLUMN segment VARCHAR(16) NOT NULL DEFAULT 'main' COMMENT '执行段: setup|main|setdown|action-setup|action-setdown(小写规范值); 存量行按 main 计' AFTER shard_key;
+--   ALTER TABLE process_action_inst DROP INDEX uk_node_def_shard, ADD UNIQUE KEY uk_node_def_shard (node_inst_id, action_def_id, shard_key, segment);
+--   ALTER TABLE process_action_inst DROP INDEX idx_container, ADD KEY idx_container (lane_id, node_inst_id, segment, status, auto_id);
+-- v1.2 命名迁移(仅当开发库已落过旧值 window-*; 生产未启用可忽略, 无约束变更):
+--   UPDATE process_action_inst SET segment='action-setup'   WHERE segment='window-setup';
+--   UPDATE process_action_inst SET segment='action-setdown' WHERE segment='window-setdown';
 CREATE TABLE process_action_inst (
   auto_id        BIGINT       NOT NULL AUTO_INCREMENT COMMENT '物理主键, 单调递增 = 声明顺序',
   action_inst_id VARCHAR(32)  NOT NULL COMMENT '业务键',
@@ -168,6 +176,7 @@ CREATE TABLE process_action_inst (
   name           VARCHAR(128) COMMENT '展示名(ActionDef.displayName: 声明 name > action id; 未声明即 action_def_id); 展示用快照, 物化期烙一次',
   handler_name   VARCHAR(128) NOT NULL COMMENT 'ActionHandler.name()',
   shard_key      VARCHAR(128) COMMENT '冗余, 便于查询',
+  segment        VARCHAR(16)  NOT NULL DEFAULT 'main' COMMENT '执行段: setup|main|setdown|action-setup|action-setdown(小写规范值); 存量行按 main 计',
   status         VARCHAR(16)  NOT NULL DEFAULT 'created',
   when_expr      VARCHAR(512) COMMENT '声明式 guard',
   visit_count    INT          NOT NULL DEFAULT 0 COMMENT '重跑计数(幂等观测)',
@@ -179,8 +188,8 @@ CREATE TABLE process_action_inst (
   updated_at     DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (auto_id),
   UNIQUE KEY uk_action_inst (action_inst_id),
-  UNIQUE KEY uk_node_def_shard (node_inst_id, action_def_id, shard_key),
-  KEY idx_container (lane_id, node_inst_id, status, auto_id)
+  UNIQUE KEY uk_node_def_shard (node_inst_id, action_def_id, shard_key, segment),
+  KEY idx_container (lane_id, node_inst_id, segment, status, auto_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- 回退/补偿历史(#16): 每个补偿步骤一行, 关联原 action_inst(不改其状态)。

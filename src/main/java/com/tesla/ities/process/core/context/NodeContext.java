@@ -10,7 +10,7 @@ import com.tesla.ities.process.domain.NodeInstEntity;
  * 父链形状: 顶层节点与匿名控制容器(PARALLEL/IF)的子节点直接挂在 ProcessContext 上;
  * **聚合节点(GROUP)的子节点挂在组的 NodeContext 上**, 于是上下文父链与实例树同形——
  * 组级共享 config(${config.<k>})与使用者**显式挂进组桶**的 result(${result.<k>})都靠这一层可读;
- * 引擎不自动向任何上级桶写值(无冒泡/挂载, 见 GroupStrategy)。因此 process() 一律**沿父链上溯**, 不再等于 parent()。
+ * 引擎不自动向任何上级桶写值(无冒泡/挂载, 见 GroupKind)。因此 process() 一律**沿父链上溯**, 不再等于 parent()。
  *
  * 派生视图:
  *  - definition() = 行内对齐期挂载的声明定义(匿名控制容器/未对齐行为 null; GROUP 有定义);

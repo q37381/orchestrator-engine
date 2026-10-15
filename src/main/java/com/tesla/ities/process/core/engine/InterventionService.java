@@ -27,7 +27,7 @@ import java.util.Set;
  *  - STOP/PAUSE 翻流程状态作闸门; owner 驱动循环每步 isCancelled 检查(读流程状态) -> 在跑的 drain, 未跑的不发。
  *  - RESUME 翻回 RUNNING; 但已退出 owner 线程的流程需重新被认领驱动(resetToPending 让 Dispatcher 重捞)。
  *  - RETRY/SKIP 失败 action: 翻该 action 状态; 因 owner 已退出, 把流程翻回 PENDING 让 Dispatcher 重新驱动,
- *    重入时已 SUCCESS/SKIPPED 的 action 跳过(见 runActionSequence 的 status 过滤), 仅重跑非终态项。
+ *    重入时已 SUCCESS/SKIPPED 的 action 跳过(见 LayerWalker.walkActions 的 status 过滤), 仅重跑非终态项。
  *  - RETRY 的默认入口以**流程实例**为发起单位({@link #retryProcess}): 一次扫完整棵实例树, 不必先查 actionInstId
  *    再逐条点; {@link #retryAction} 留作定点重跑那一条的细粒度入口。两者共用同一套复位口径(RESETTABLE)。
  *
@@ -47,13 +47,18 @@ public class InterventionService {
     /**
      * 重试复位集(action / node 行): **"本轮没跑成"** 的那些。
      *  - FAILED / STOPPED: 坏终态 —— 前者是跑挂了, 后者多半是 drain 掉的、压根没执行过;
-     *  - RUNNING / PENDING: 卡在途中(owner 崩溃留下的行、备用认领路径翻走的行), 不复位就永远没人再跑它。
+     *  - RUNNING / PENDING: 卡在途中(owner 崩溃留下的行、备用认领路径翻走的行、handler 让渡等重入的行),
+     *    不复位就永远没人再跑它 —— 复位成 CREATED 与"非终态行重跑"同效(让渡重入本就重跑非终态行)。
      * SUCCESS 是既成事实, SKIPPED 还包含人工跳过与 guard 判假(重跑它等于否定那次干预), 所以都不复位。
      */
     private static final Set<Status> RESETTABLE =
             EnumSet.of(Status.FAILED, Status.STOPPED, Status.RUNNING, Status.PENDING);
 
-    /** 闸门允许翻回 PENDING 的流程状态: SUCCESS/SKIPPED 的流程不许重跑, CREATED 本就还没被认领过。 */
+    /**
+     * 闸门允许翻回 PENDING 的流程状态: SUCCESS/SKIPPED 的流程不许重跑, CREATED 本就还没被认领过。
+     * SUSPENDED(handler 让渡的停驻态)不在列: 本期不做唤醒入口(停驻流程重试也救不回, 按需再扩);
+     * PAUSED 在列: 让渡到 paused 的流程走 resume/重试都能翻回 PENDING 重新入队。
+     */
     private static final Set<Status> REQUEUEABLE =
             EnumSet.of(Status.FAILED, Status.STOPPED, Status.RUNNING, Status.PAUSED);
 

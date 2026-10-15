@@ -42,7 +42,7 @@ public class ContextFactory {
     /**
      * 建节点级上下文。parent = **直属上层容器**: 顶层节点与匿名控制容器(PARALLEL/IF)的子节点传 ProcessContext;
      * 聚合节点(GROUP)的子节点传组的 NodeContext(上下文父链与实例树同形, 组级 config 与显式挂进组桶的
-     * result 对子节点可读; 引擎不自动向容器桶写值, 见 GroupStrategy)。
+     * result 对子节点可读; 引擎不自动向容器桶写值, 见 GroupKind)。
      */
     public NodeContext node(Context parent, NodeInstEntity n) {
         NodeContext c = new NodeContext(parent, n);          // 上下文直接带行(定义/走查光标都在行上)

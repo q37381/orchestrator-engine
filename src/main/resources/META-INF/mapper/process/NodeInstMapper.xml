@@ -16,7 +16,6 @@
         <result property="type"           column="type"/>
         <result property="parentId"       column="parent_id"/>
         <result property="status"         column="status"/>
-        <result property="pending"        column="pending"/>
         <result property="errorPolicy"    column="error_policy"/>
         <result property="shardEnabled"   column="shard_enabled"/>
         <result property="shardResolver"  column="shard_resolver"/>
@@ -30,7 +29,7 @@
     </resultMap>
 
     <sql id="columns">
-        auto_id, node_inst_id, proc_inst_id, node_def_id, name, type, parent_id, status, pending,
+        auto_id, node_inst_id, proc_inst_id, node_def_id, name, type, parent_id, status,
         error_policy, shard_enabled, shard_resolver, condition_expr,
         config, result, creator_id, updator_id, created_at, updated_at
     </sql>

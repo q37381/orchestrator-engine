@@ -18,6 +18,7 @@
         <result property="name"          column="name"/>
         <result property="handlerName"   column="handler_name"/>
         <result property="shardKey"      column="shard_key"/>
+        <result property="segment"       column="segment"/>
         <result property="status"        column="status"/>
         <result property="whenExpr"      column="when_expr"/>
         <result property="visitCount"    column="visit_count"/>
@@ -31,7 +32,7 @@
 
     <sql id="columns">
         auto_id, action_inst_id, node_inst_id, lane_id, action_def_id, name, handler_name,
-        shard_key, status, when_expr, visit_count, config, result,
+        shard_key, segment, status, when_expr, visit_count, config, result,
         creator_id, updator_id, created_at, updated_at
     </sql>
 
@@ -49,9 +50,9 @@
     <insert id="insertIgnore" parameterType="com.tesla.ities.process.domain.ActionInstEntity"
             useGeneratedKeys="true" keyProperty="autoId" keyColumn="auto_id">
         INSERT IGNORE INTO ${orch.table.actionInst}(action_inst_id, node_inst_id, lane_id, action_def_id, name, handler_name,
-                                       shard_key, status, when_expr, config, creator_id, updator_id)
+                                       shard_key, segment, status, when_expr, config, creator_id, updator_id)
         VALUES(#{actionInstId}, #{nodeInstId}, #{laneId}, #{actionDefId}, #{name}, #{handlerName},
-               #{shardKey}, #{status}, #{whenExpr}, #{config}, #{creatorId}, #{updatorId})
+               #{shardKey}, #{segment}, #{status}, #{whenExpr}, #{config}, #{creatorId}, #{updatorId})
     </insert>
 
     <select id="findById" resultMap="BaseResultMap">
@@ -60,11 +61,13 @@
         WHERE action_inst_id = #{id}
     </select>
 
-    <!-- 容器内全部 action(按声明顺序); actionDefId 非 null 时按自然键 (node, lane, actionDefId) 只取一条。 -->
+    <!-- 容器内全部 action(按声明顺序); actionDefId 非 null 时按自然键 (node, lane, segment, actionDefId) 只取一条。
+         segment 非 null 只取该执行段(走查段内定位/回退只扫 main 用); null = 不按段收窄(进度视图要全量)。 -->
     <select id="findInContainer" resultMap="BaseResultMap">
         SELECT <include refid="columns"/>
         FROM ${orch.table.actionInst}
         WHERE <include refid="containerMatch"/>
+        <if test="segment != null">AND segment = #{segment}</if>
         <if test="actionDefId != null">AND action_def_id = #{actionDefId}</if>
         ORDER BY auto_id ASC
         <if test="actionDefId != null">LIMIT 1</if>

@@ -178,16 +178,20 @@ public class MapperBindingTest {
         Assert.assertTrue(child.contains("AND parent_id = ?"));
         Assert.assertTrue("声明顺序由 auto_id 承载", child.endsWith("ORDER BY auto_id ASC"));
 
-        // action: laneId=null -> 非分片行; actionDefId 非 null -> 自然键单条
-        p = params("nodeInstId", "N1", "laneId", null, "actionDefId", null);
+        // action: laneId=null -> 非分片行; segment 非 null -> 段过滤; actionDefId 非 null -> 自然键单条
+        p = params("nodeInstId", "N1", "laneId", null, "actionDefId", null, "segment", null);
         String all = sql("ActionInstMapper.findInContainer", p);
         Assert.assertTrue(all.contains("AND lane_id IS NULL"));
         Assert.assertFalse(all.contains("action_def_id ="));
+        Assert.assertFalse("segment=null 不按段收窄(进度/回退收集要全量或显式给段)", all.contains("segment ="));
         Assert.assertTrue(all.endsWith("ORDER BY auto_id ASC"));
+        p.put("segment", "setdown");
+        Assert.assertTrue(sql("ActionInstMapper.findInContainer", p).contains("AND segment = ?"));
         p.put("laneId", "L1");
         p.put("actionDefId", "check-sql");
         String one = sql("ActionInstMapper.findInContainer", p);
         Assert.assertTrue(one.contains("AND lane_id = ?"));
+        Assert.assertTrue(one.contains("AND segment = ?"));
         Assert.assertTrue(one.contains("AND action_def_id = ?"));
         Assert.assertTrue("非分片 shard_key=NULL 不去重, 自然键定位必须 LIMIT 1",
                 one.endsWith("ORDER BY auto_id ASC LIMIT 1"));
@@ -241,7 +245,7 @@ public class MapperBindingTest {
 
     /**
      * 表命名空间: ${orch.table.*} 在 XML 装载期做一次性文本替换(不是运行期拼接)。
-     * 契约(与 ProcessEngineConfig.buildTableVariables 同口径): **7 张表一律 = 前缀 + 表名**,
+     * 契约(与 ProcessEngineConfig.buildTableVariables 同口径): **8 张表一律 = 前缀 + 表名**,
      * process_definition / process_inst 也不例外——名字里的 "process" 就是默认前缀本身, 不是固定名的一部分。
      *  1) 默认前缀 process_ 已由其余用例的期望串证明;
      *  2) 自定义前缀下连 JOIN 链上的流程表一起换名(三条语句段同一前缀, 不留换不掉的死角);

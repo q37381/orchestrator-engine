@@ -7,7 +7,7 @@ import org.apache.ibatis.annotations.Param;
 
 /**
  * process_definition 数据访问(一表多版本, 定义不可变)。
- * SQL 见 resources/mapper/orchestrator/ProcessDefinitionMapper.xml。
+ * SQL 见 resources/META-INF/mapper/process/ProcessDefinitionMapper.xml。
  *
  * 精简说明: 原 find / findLatestPublished 只差"按版本定位还是取最新已发布", 合并为一个 {@link #find}。
  *

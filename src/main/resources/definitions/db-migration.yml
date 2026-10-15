@@ -63,6 +63,21 @@ setup:
 setdown:
   - finalizeReport
 
+# 节点级 setup/setdown 段(可选): 节点**内部**的"前置/收尾"动作序列(内联声明, 与 actions 同构)——
+# 用于"数据同步前暂停主从复制、同步后恢复"这类必须成对、且崩溃/重试后能补跑的场景:
+#   dataSync:
+#     setup:
+#       - id: pauseReplication          # 主段之前逐项执行; 段坏(FAILED/STOPPED)则跳过主段, 收尾照跑
+#         handler: slavePause
+#     actions:
+#       - id: doSync
+#         handler: dataSync
+#     setdown:
+#       - id: resumeReplication         # finally 语义: 无论主段成败都执行; 未跑完的 retry 续跑补上
+#         handler: slaveResume
+# 口径: 分片节点每 lane 各跑一遍三段(段内可读 ${lane.shardKey}); 段行落 process_action_inst.segment
+# 列(setup|main|setdown), 已成功段重入/重试幂等跳过; 回退只扫主段(段行不参与补偿)。
+
 nodes:
   # name = 展示名(可选): 未声明则回落节点 id(map 键); id 才是 flow DSL 里的引用键, 改名不用动 flow。
   # 定义级属性, 不落实例表(同监听器链)——监听器/handler 经 ctx.nodes()/NodeContext.name() 读。

@@ -5,7 +5,7 @@ import java.time.LocalDateTime;
 /** lane 行(持久化实体): 分片节点的同 shardKey 共享边界 + 调度实体。 */
 public class LaneEntity {
     private Long autoId;          // 物理主键
-    private String laneId;        // 业务键 varchar(20)
+    private String laneId;        // 业务键 varchar(32)
     private String procInstId;
     private String nodeInstId;    // 所属分片节点业务键
     private String shardKey;

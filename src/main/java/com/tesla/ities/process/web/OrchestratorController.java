@@ -11,7 +11,7 @@ import java.util.Map;
 
 /**
  * REST 入口: 创建/启动/干预/进度/回退。
- * 简单同步返回, 长流程执行由后台调度器驱动。业务键均为 varchar(20) 字符串。
+ * 简单同步返回, 长流程执行由后台调度器驱动。业务键均为 varchar(32) 字符串。
  * 执行类入口(create?autoStart / start)返 procInstId + status; 其余保原语义。
  *
  * <p>刻意放在 {@code process.web} 而非 {@code process.api}: 引擎的组件扫描范围是 core/api/util

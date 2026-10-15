@@ -6,14 +6,26 @@ import com.tesla.ities.process.core.runtime.VariableResolver;
 import com.tesla.ities.process.exception.ProcessException;
 import org.junit.Assert;
 import org.junit.Test;
+import org.junit.runner.RunWith;
+import org.mockito.InjectMocks;
+import org.mockito.Spy;
+import org.mockito.junit.MockitoJUnitRunner;
 
 /**
  * 条件求值器全分支: 数值/字符串比较、六比较符、&& || ! 与括号、裸布尔/字面量、
  * 未解析占位符按字面量比较、空表达式恒真、非数值不可比较抛异常。
+ *
+ * 装配口径: 求值器 {@code @InjectMocks}; 它唯一的协作者 VariableResolver 本类要跑**真解析**
+ * (占位符解不出/解得出正是被钉的行为), 所以是 {@code @Spy} 而不是替身。
  */
+@RunWith(MockitoJUnitRunner.class)
 public class ConditionEvaluatorTest {
 
-    private final ConditionEvaluator ev = new ConditionEvaluator(new VariableResolver());
+    @Spy
+    private VariableResolver resolver = new VariableResolver();
+
+    @InjectMocks
+    private ConditionEvaluator ev;
 
     private boolean eval(String expr) {
         return ev.eval(expr, new ProcessContext("p"));

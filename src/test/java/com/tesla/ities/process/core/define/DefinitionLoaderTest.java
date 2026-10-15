@@ -5,6 +5,9 @@ import com.tesla.ities.process.exception.ProcessException;
 import com.tesla.ities.process.util.Json;
 import org.junit.Assert;
 import org.junit.Test;
+import org.junit.runner.RunWith;
+import org.mockito.InjectMocks;
+import org.mockito.junit.MockitoJUnitRunner;
 
 import java.io.InputStream;
 import java.util.ArrayList;
@@ -16,10 +19,14 @@ import java.util.Map;
  * YAML -> ProcessDefinition 的解析回归(顺带钉住 SnakeYAML 2.x 迁移):
  *  - 2.0 起 SafeConstructor 无参构造被删, 只留 (LoaderOptions) —— 这里真实跑三份示例定义, 保证不只是编得过;
  *  - 三份示例定义(definitions/*.yml)在 main/resources 下, 测试类路径直接可读。
+ *
+ * 装载器没有协作者(读的是入参字符串/类路径资源), 按 {@code @InjectMocks} 口径由 Mockito 造。
  */
+@RunWith(MockitoJUnitRunner.class)
 public class DefinitionLoaderTest {
 
-    private final DefinitionLoader loader = new DefinitionLoader();
+    @InjectMocks
+    private DefinitionLoader loader;
 
     private ProcessDefinition loadResource(String path) {
         try (InputStream in = Thread.currentThread().getContextClassLoader().getResourceAsStream(path)) {
@@ -324,5 +331,128 @@ public class DefinitionLoaderTest {
         List<String> after = flowOrderIds(Json.read(snapshot, ProcessDefinition.class));
         Assert.assertEquals(Arrays.asList("a", "b", "c"), before);
         Assert.assertEquals("副本重解析 DSL 后顺序一致", before, after);
+    }
+
+    // ===================== 节点级 setup/setdown 段 =====================
+
+    /** 段与 actions 同构解析(内联动作列表挂 NodeDef); 未声明/留空同口径回落 null。 */
+    @Test
+    public void nodeSegmentsParseInlineActionLists() {
+        ProcessDefinition def = loader.load("flow: \"a\"\n"
+                + "nodes:\n  a:\n    actions:\n      - id: m1\n        handler: h\n"
+                + "    setup:\n      - id: p1\n        handler: h\n        config:\n          mode: pause\n"
+                + "    setdown:\n      - id: r1\n        handler: h\n");
+        NodeDef a = def.node("a");
+        Assert.assertEquals(1, a.getSetup().size());
+        Assert.assertEquals("p1", a.getSetup().get(0).getId());
+        Assert.assertEquals("段项 config 同构解析", "pause", a.getSetup().get(0).getConfig().get("mode"));
+        Assert.assertEquals(1, a.getSetdown().size());
+        Assert.assertEquals("r1", a.getSetdown().get(0).getId());
+        Assert.assertEquals("主段不受影响", 1, a.effectiveActions().size());
+
+        NodeDef bare = loader.load("flow: \"a\"\nnodes:\n  a:\n    handler: h\n").node("a");
+        Assert.assertNull("未声明段 = null", bare.getSetup());
+        Assert.assertNull(bare.getSetdown());
+        NodeDef blank = loader.load("flow: \"a\"\nnodes:\n  a:\n    handler: h\n    setup:\n    setdown:\n").node("a");
+        Assert.assertNull("段名写了但留空 = null(与整段缺失同口径)", blank.getSetup());
+        Assert.assertNull(blank.getSetdown());
+    }
+
+    /** 段装载校验: id 合并唯一 / 段缺主段 / 容器声明段, 全部当场拒。 */
+    @Test
+    public void nodeSegmentValidationsRejectAtLoadTime() {
+        assertLoadFails("flow: \"a\"\nnodes:\n  a:\n"
+                + "    actions:\n      - id: dup\n        handler: h\n"
+                + "    setup:\n      - id: dup\n        handler: h\n", "AU204215");
+        assertLoadFails("flow: \"a\"\nnodes:\n  a:\n    handler: h\n"
+                + "    setdown:\n      - id: a\n        handler: h\n", "AU204215");   // 与单 handler 合成的主段 id(节点 id)撞
+        assertLoadFails("flow: \"a\"\nnodes:\n  a:\n"
+                + "    setup:\n      - id: p1\n        handler: h\n", "AU204216");   // 段缺主段
+        assertLoadFails("flow: \"g\"\nnodes:\n  g:\n    setup:\n      - handler: h\n"
+                + "    group:\n      flow: \"s\"\n      nodes:\n        s:\n          handler: h\n", "AU204204");   // 聚合容器是纯容器
+    }
+
+    /** 段与 repeatSegments 字段随定义 JSON 快照往返(定义缓存借出的副本仍带声明)。 */
+    @Test
+    public void nodeSegmentsSurviveSnapshotRoundTrip() {
+        ProcessDefinition def = loader.load("flow: \"a\"\nnodes:\n  a:\n    handler: h\n"
+                + "    repeatSegments: true\n"
+                + "    setup:\n      - id: p1\n        handler: h\n"
+                + "    setdown:\n      - id: r1\n        handler: h\n");
+        String snapshot = Json.write(def);
+        Assert.assertFalse("派生视图不入快照(repeatSegmentsEnabled 无 setter)", snapshot.contains("repeatSegmentsEnabled"));
+        ProcessDefinition copy = Json.read(snapshot, ProcessDefinition.class);
+        Assert.assertEquals("p1", copy.node("a").getSetup().get(0).getId());
+        Assert.assertEquals("r1", copy.node("a").getSetdown().get(0).getId());
+        Assert.assertTrue("开关随快照往返", copy.node("a").repeatSegmentsEnabled());
+    }
+
+    // ===================== v1.1: repeatSegments 开关 =====================
+
+    /** 开关解析与三层校验: 节点级/流程级合法解析; 死配置(AU204217/218)、非法值(AU204219)、容器声明(AU204204)当场拒。 */
+    @Test
+    public void repeatSegmentsParsesAndRejectsDeadConfig() {
+        ProcessDefinition def = loader.load("flow: \"a\"\nnodes:\n  a:\n    handler: h\n"
+                + "    repeatSegments: true\n"
+                + "    setup:\n      - id: p1\n        handler: h\n");
+        Assert.assertTrue("节点级开关解析", def.node("a").repeatSegmentsEnabled());
+        Assert.assertEquals("归一化小写文本", "true", def.node("a").getRepeatSegments());
+
+        ProcessDefinition top = loader.load("repeatSegments: true\nsetup: [s]\nflow: \"a\"\nnodes:\n"
+                + "  s:\n    handler: h\n  a:\n    handler: h\n");
+        Assert.assertTrue("流程级开关解析", top.repeatSegmentsEnabled());
+
+        assertLoadFails("flow: \"a\"\nnodes:\n  a:\n    handler: h\n    repeatSegments: true\n", "AU204217");
+        assertLoadFails("repeatSegments: true\nflow: \"a\"\nnodes:\n  a:\n    handler: h\n", "AU204218");
+        assertLoadFails("flow: \"a\"\nnodes:\n  a:\n    handler: h\n    repeatSegments: abc\n", "AU204219");
+        assertLoadFails("flow: \"g\"\nnodes:\n  g:\n    repeatSegments: false\n"
+                + "    group:\n      flow: \"s\"\n      nodes:\n        s:\n          handler: h\n", "AU204204");
+    }
+
+    // ===================== v1.2: action 级段 =====================
+
+    /** action 级段解析(同动作双挂)与快照往返; 单边/段动作带标记/ id 冲突/并行互斥 装载期拒。 */
+    @Test
+    public void actionLevelSegmentsParseAndValidate() {
+        ProcessDefinition def = loader.load("flow: \"a\"\nnodes:\n  a:\n    actions:\n"
+                + "      - id: m1\n        handler: h\n"
+                + "        setup:\n          - id: w1\n            handler: h\n"
+                + "        setdown:\n          - id: w2\n            handler: h\n");
+        Assert.assertEquals("w1", def.node("a").getActions().get(0).getSetup().get(0).getId());
+        Assert.assertEquals("w2", def.node("a").getActions().get(0).getSetdown().get(0).getId());
+        ProcessDefinition copy = Json.read(Json.write(def), ProcessDefinition.class);
+        Assert.assertEquals("段声明随快照往返", "w1",
+                copy.node("a").getActions().get(0).getSetup().get(0).getId());
+
+        assertLoadFails("flow: \"a\"\nnodes:\n  a:\n    actions:\n"
+                + "      - id: m1\n        handler: h\n"
+                + "        setup:\n          - id: w1\n            handler: h\n", "AU204220");
+        assertLoadFails("flow: \"a\"\nnodes:\n  a:\n    actions:\n"
+                + "      - id: m1\n        handler: h\n"
+                + "        setdown:\n          - id: w2\n            handler: h\n", "AU204221");
+        assertLoadFails("flow: \"a\"\nnodes:\n  a:\n    actions:\n"
+                + "      - id: m1\n        handler: h\n"
+                + "        setup:\n          - id: w1\n            handler: h\n"
+                + "            setdown:\n              - id: w2\n                handler: h\n", "AU204222");
+        assertLoadFails("flow: \"a\"\nnodes:\n  a:\n    actions:\n"
+                + "      - id: m1\n        handler: h\n"
+                + "        setup:\n          - id: dup\n            handler: h\n"
+                + "        setdown:\n          - id: s1\n            handler: h\n"
+                + "      - id: m2\n        handler: h\n"
+                + "        setup:\n          - id: dup\n            handler: h\n"
+                + "        setdown:\n          - id: s2\n            handler: h\n", "AU204223");
+        assertLoadFails("flow: \"a\"\nnodes:\n  a:\n    actionExecution: PARALLEL\n    actions:\n"
+                + "      - id: m1\n        handler: h\n"
+                + "        setup:\n          - id: w1\n            handler: h\n"
+                + "        setdown:\n          - id: w2\n            handler: h\n", "AU204224");
+    }
+
+    private void assertLoadFails(String yaml, String code) {
+        try {
+            loader.load(yaml);
+            Assert.fail("应装载期拒绝: " + code);
+        } catch (ProcessException e) {
+            Assert.assertEquals(code, e.getMessageKey());
+        }
     }
 }

@@ -8,11 +8,11 @@ import org.apache.ibatis.annotations.Param;
 import java.util.List;
 
 /**
- * action_inst 数据访问。SQL 见 resources/mapper/orchestrator/ActionInstMapper.xml。
+ * action_inst 数据访问。SQL 见 resources/META-INF/mapper/process/ActionInstMapper.xml。
  *
  * 精简说明:
  *  - findInContainer / findByContainerAndDef 只差"是否按 action_def_id 收到自然键一条", 合并为
- *    {@link #findInContainer}(laneId/actionDefId 都可空);
+ *    {@link #findInContainer}(laneId/actionDefId/segment 都可空);
  *  - setStatus / casStatus / activate / updateResult 合并为一条动态 {@link #updateState},
  *    落 result 时同句 visit_count++(重跑观测), 与原 updateResult 语义一致。
  * 语义快捷方法都是 default, 不额外产生 SQL 语句; 审计列 updator_id 由调用方从上下文显式下传(null = 不刷)。
@@ -32,11 +32,13 @@ public interface ActionInstMapper {
      * 容器(lane 或非分片 node)内的 action, 按 auto_id(声明顺序)升序。
      * laneId=null 匹配 lane_id IS NULL 的非分片行。
      *
-     * @param actionDefId null = 容器内全部; 非 null = 按自然键 (node, lane, actionDefId) 只定位一条
+     * @param actionDefId null = 容器内全部; 非 null = 按自然键 (node, lane, segment, actionDefId) 只定位一条
+     * @param segment     null = 不按段收窄(进度视图要全量); 非 null = 只取该执行段(setup|main|setdown)
      */
     List<ActionInstEntity> findInContainer(@Param("nodeInstId") String nodeInstId,
                                            @Param("laneId") String laneId,
-                                           @Param("actionDefId") String actionDefId);
+                                           @Param("actionDefId") String actionDefId,
+                                           @Param("segment") String segment);
 
     /**
      * action 列表查询: nodeInstId / actionInstId 两个条件都可选(通常传其一, 都给则取交集),
@@ -65,17 +67,19 @@ public interface ActionInstMapper {
 
     // ---------- 语义快捷(都走 findInContainer / updateState) ----------
 
-    /** 容器(lane 或非分片 node)内全部 action, 按声明顺序升序。 */
+    /** 容器(lane 或非分片 node)内全部 action(不按段收窄), 按声明顺序升序。 */
     default List<ActionInstEntity> findInContainer(String nodeInstId, String laneId) {
-        return findInContainer(nodeInstId, laneId, null);
+        return findInContainer(nodeInstId, laneId, null, null);
     }
 
     /**
-     * 按自然键 (node, lane, actionDefId) 定位单条 action(幂等物化 find-or-create 用)。
+     * 按自然键 (node, lane, segment, actionDefId) 定位单条 action(幂等物化 find-or-create 用)。
+     * segment 必须显式给出——跨段可能同名 id, 不带段的定位会串段。
      * laneId=null 匹配非分片行; 非分片 shard_key=NULL 时 uk_node_def_shard 不去重, 故取声明顺序最早的一条。
      */
-    default ActionInstEntity findByContainerAndDef(String nodeInstId, String laneId, String actionDefId) {
-        List<ActionInstEntity> rows = findInContainer(nodeInstId, laneId, actionDefId);
+    default ActionInstEntity findByContainerAndDef(String nodeInstId, String laneId,
+                                                   String actionDefId, String segment) {
+        List<ActionInstEntity> rows = findInContainer(nodeInstId, laneId, actionDefId, segment);
         return rows.isEmpty() ? null : rows.get(0);
     }
 

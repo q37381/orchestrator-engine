@@ -5,7 +5,6 @@ import com.tesla.ities.process.core.engine.ExecutionEngine;
 import com.tesla.ities.process.mapper.ProcessInstMapper;
 import org.mybatis.spring.SqlSessionFactoryBean;
 import org.mybatis.spring.mapper.MapperScannerConfigurer;
-import org.springframework.beans.factory.NoUniqueBeanDefinitionException;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.ApplicationContext;
 import org.springframework.context.annotation.Bean;
@@ -39,8 +38,8 @@ import java.util.concurrent.ThreadPoolExecutor;
  *
  * <h3>MyBatis(引擎自建, 与消费者互不干扰)</h3>
  * <ul>
- *   <li>{@code orchestratorSqlSessionFactory} — 引擎专用, 用消费者的 DataSource</li>
- *   <li>{@code orchestratorMapperScanner} — 引擎专用, 只扫 {@code com.orchestrator.mapper}</li>
+ *   <li>{@code processSqlSessionFactory} — 引擎专用, 用消费者的 DataSource</li>
+ *   <li>{@code orchestratorMapperScanner} — 引擎专用, 只扫 {@code com.tesla.ities.process.mapper}</li>
  *   <li>与消费者自己的 SqlSessionFactory / Mapper 在不同 Bean 名、不同 package, 完全隔离</li>
  * </ul>
  *
@@ -56,8 +55,8 @@ import java.util.concurrent.ThreadPoolExecutor;
  * 要更彻底地自定义某一档, 声明同名 Bean 覆盖即可。
  *
  * <h3>业务键序列(消费者提供五个 Bean)</h3>
- * 五类业务键各走一条序列, 一条序列 = 一个 {@code com.tesla.bcs.sequence.StringSequenceGenerator} Bean,
- * 取号走无参 {@code getStringSequence()}; 引擎按 <b>Bean 名</b>注入(名字对不上就不注入, 见下):
+ * 五类业务键各走一条序列, 一条序列 = 一个 {@code com.tesla.bcs.sequence.StringSequenceGenerator} Bean(那是个**接口**,
+ * 真身在宿主 bcs 依赖里), 取号走无参 {@code getStringSequence()}; 引擎按 <b>Bean 名</b>注入(名字对不上就不注入, 见下):
  * <ul>
  *   <li>{@code processInstSequenceGenerator} — process_inst.proc_inst_id</li>
  *   <li>{@code nodeInstSequenceGenerator} — process_node_inst.node_inst_id</li>
@@ -65,8 +64,9 @@ import java.util.concurrent.ThreadPoolExecutor;
  *   <li>{@code actionInstSequenceGenerator} — process_action_inst.action_inst_id</li>
  *   <li>{@code rollbackRecordSequenceGenerator} — process_rollback_record.rollback_id</li>
  * </ul>
- * 引擎<b>不创建</b>这些 Bean, 也不要求它们存在(缺哪个就回落本地时间戳序列并打一条 WARN, 启动不受影响);
- * 宿主已有同名类时把引擎里那份替身 {@code com/tesla/bcs/sequence/StringSequenceGenerator.java} 删掉即可。
+ * 引擎<b>不创建</b>这些 Bean, 也不在启动期要求它们齐备(注入是 required = false); 但<b>取号时</b>该种类没绑上
+ * Bean 就当场抛 {@code ProcessException}(AU204801, 报清缺的是哪个名字)——引擎不自造号, 唯一性只能由宿主那条序列给。
+ * 宿主已有同名接口时把引擎里那份替身 {@code com/tesla/bcs/sequence/StringSequenceGenerator.java} 删掉即可(取号方法签名对上就接得上)。
  * 想换 Bean 名只改 {@code IdKind} 那五行枚举声明(Bean 名只在那儿定义一次), 或调
  * {@code IdGenerator.setSequence(IdKind, generator)} 显式绑。
  *
@@ -86,8 +86,7 @@ import java.util.concurrent.ThreadPoolExecutor;
 @ComponentScan(basePackages = {
         "com.tesla.ities.process.core",
         "com.tesla.ities.process.api",
-        "com.tesla.ities.process.util",
-        "com.tesla.ities.process.executor"
+        "com.tesla.ities.process.util"
 })
 public class ProcessEngineConfig {
 
@@ -100,10 +99,25 @@ public class ProcessEngineConfig {
     // ========== Dispatcher 能力(分布式路由: 本 worker 服务哪个单元 / 哪个网络区域) ==========
     // 两者都为空 = 全局模式(claim 走老逻辑捞全部 pending, 不看调度表, 单机/存量部署零影响);
     // 配了 unit + zone = 路由模式(只主动认领调度表里命中本能力的流程)。一台节点只对应一个 unit + 一个 zone。
-    @Value("${ities.process.dispatcher.unit:}")
+    // 不走 property 注入: 需要路由的部署在声明 orchestratorDispatcher Bean 时调 set 显式赋值(同 setDataSource 口径)。
     private String dispatcherUnit = "";
-    @Value("${ities.process.dispatcher.zone:}")
     private String dispatcherZone = "";
+
+    public String getDispatcherUnit() {
+        return dispatcherUnit;
+    }
+
+    public void setDispatcherUnit(String v) {
+        this.dispatcherUnit = v;
+    }
+
+    public String getDispatcherZone() {
+        return dispatcherZone;
+    }
+
+    public void setDispatcherZone(String v) {
+        this.dispatcherZone = v;
+    }
 
     // ========== 表命名空间(嵌入式组件不假设裸表名可用) ==========
 
@@ -123,10 +137,10 @@ public class ProcessEngineConfig {
     }
 
     /**
-     * 由前缀派生 7 张表的变量(引擎与测试共用同一口径, 不两处各写一份)。
-     * 一律 **前缀 + 表名**, 七张都不例外: 默认前缀 "process_" 展开后就是 db/schema.sql 里的
+     * 由前缀派生 8 张表的变量(引擎与测试共用同一口径, 不两处各写一份)。
+     * 一律 **前缀 + 表名**, 八张都不例外: 默认前缀 "process_" 展开后就是 db/schema.sql 里的
      * process_definition / process_inst / process_node_inst..., 名字里那个 "process" 是前缀本身而非固定名。
-     * 撞名时改 tablePrefix 让 7 张整体挪窝(设 "" 回落到存量裸名), 不给自己留换不掉的死角。
+     * 撞名时改 tablePrefix 让 8 张整体挪窝(设 "" 回落到存量裸名), 不给自己留换不掉的死角。
      * 变量必须显式 put(含空串): PropertyParser 对解不到的占位符原样留在 SQL 里 = 语法错误。
      */
     public static Properties buildTableVariables(String prefix) {
@@ -182,22 +196,6 @@ public class ProcessEngineConfig {
         this.dispatcherClaimBatch = v;
     }
 
-    public String getDispatcherUnit() {
-        return dispatcherUnit;
-    }
-
-    public void setDispatcherUnit(String v) {
-        this.dispatcherUnit = v;
-    }
-
-    public String getDispatcherZone() {
-        return dispatcherZone;
-    }
-
-    public void setDispatcherZone(String v) {
-        this.dispatcherZone = v;
-    }
-
     // ========== Dispatcher ==========
 
     // @Bean
@@ -223,9 +221,9 @@ public class ProcessEngineConfig {
 
     /**
      * 引擎专用 SqlSessionFactory, 用消费者的 DataSource。
-     * Bean 名 orchestratorSqlSessionFactory, 与消费者自己的 sqlSessionFactory 互不干扰。
+     * Bean 名 processSqlSessionFactory, 与消费者自己的 sqlSessionFactory 互不干扰。
      * <p>
-     * SQL 全部在引擎自带的 mapper/orchestrator/*.xml 里(带 resultMap 显式列映射),
+     * SQL 全部在引擎自带的 META-INF/mapper/process/*.xml 里(带 resultMap 显式列映射),
      * 路径独立于消费者的 mapper/, 互不误加载。
      */
     @Bean
@@ -250,7 +248,7 @@ public class ProcessEngineConfig {
     }
 
     /**
-     * 引擎专用 MapperScanner, 只扫 com.orchestrator.mapper。
+     * 引擎专用 MapperScanner, 只扫 com.tesla.ities.process.mapper。
      * 消费者的 Mapper 在不同 package, 多个 scanner 共存不冲突。
      */
     @Bean

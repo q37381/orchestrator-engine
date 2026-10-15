@@ -50,6 +50,7 @@ public class ProcessDefinition {
     private String flow;                                          // DSL: "A,B,PARALLEL(C,D),IF(x,E,F)"
     private String errorPolicy;                                   // 全局错误策略(节点未声明时的回落; null = 默认 FAIL_FAST)
     private String autoRollback;                                  // 自动回退开关(true/false 文本; null 或未声明 = 只走人工回退)
+    private String repeatSegments;                                // 段重复执行开关(true/false 文本, v1.1; null = 只走成对重臂默认语义)
     private Map<String, NodeDef> nodes = new LinkedHashMap<>();
 
     /** flow 解析结果(顶层表达式列表), 惰性一次性解析, 不参与 JSON 序列化。 */
@@ -152,6 +153,12 @@ public class ProcessDefinition {
     public void setAutoRollback(String v) {
         this.autoRollback = v;
     }
+    public String getRepeatSegments() {
+        return repeatSegments;
+    }
+    public void setRepeatSegments(String v) {
+        this.repeatSegments = v;
+    }
     public Map<String, NodeDef> getNodes() {
         return nodes;
     }
@@ -213,7 +220,7 @@ public class ProcessDefinition {
      * 全局 {@code FAIL_FAST} 里也可以把**锦上添花的校验项**标成失败不拦路。匿名 PARALLEL/IF 无 NodeDef, 恒回落全局。
      *
      * 本方法**只作用于根序列这一层**: 容器内部(组内子项/并行扇出/叶子 action)的收敛一律只看容器自己那一条
-     * errorPolicy, 子项声明不跨越本层(见 GroupStrategy/ParallelStrategy)。
+     * errorPolicy, 子项声明不跨越本层(见 GroupKind/ParallelKind)。
      */
     @JsonIgnore
     public boolean stopsSequence(NodeDef item, ErrorPolicy ownerPolicy) {
@@ -244,6 +251,15 @@ public class ProcessDefinition {
     @JsonIgnore
     public boolean autoRollbackEnabled() {
         return Boolean.TRUE.equals(parseSwitch(autoRollback));
+    }
+
+    /**
+     * 是否开了段"每趟驱动重跑"开关(v1.1 派生视图, 非属性): 节点级/流程级同名字段, 声明值算出 true 才算开。
+     * 顶层开启时顶层 setup/setdown 段的根行每趟驱动都重臂; 未声明按关闭算(拼错的装载期已拒)。
+     */
+    @JsonIgnore
+    public boolean repeatSegmentsEnabled() {
+        return Boolean.TRUE.equals(parseSwitch(repeatSegments));
     }
 
     /**
@@ -309,39 +325,18 @@ public class ProcessDefinition {
         return out;
     }
 
-    /** 前序收集一个表达式: 能定位到 NodeDef 的才进结果, 控制表达式则继续展开其子表达式。 */
+    /**
+     * 前序收集一个表达式: 能定位到 NodeDef 的才进结果, 容器则继续展开其子表达式。
+     * 完全按 {@code defRef()}/{@code children()} 自述递归, 不再按类型分派——叶子/命名并行/聚合走同一条规则
+     * (有声明键就自己算一项, 匿名 PARALLEL/IF 无声明键所以不出现, 只往下走)。
+     */
     private void collectInFlowOrder(DslParser.Expr e, List<NodeDef> out) {
-        if (e instanceof DslParser.Leaf) {
-            NodeDef nd = node(((DslParser.Leaf) e).nodeRef);
-            if (nd != null) {
-                out.add(nd);
-            }
-        } else if (e instanceof DslParser.Parallel) {
-            DslParser.Parallel par = (DslParser.Parallel) e;
-            if (par.name != null) {                 // 命名后缀的命名并行容器: 自己算一项(承载策略/guard/config), 子项紧随
-                NodeDef nd = node(par.name);
-                if (nd != null) {
-                    out.add(nd);
-                }
-            }
-            for (DslParser.Expr item : par.items) {
-                collectInFlowOrder(item, out);
-            }
-        } else if (e instanceof DslParser.Group) {
-            DslParser.Group group = (DslParser.Group) e;
-            NodeDef nd = node(group.name);
-            if (nd != null) {
-                out.add(nd);
-            }
-            for (DslParser.Expr item : group.items) {
-                collectInFlowOrder(item, out);
-            }
-        } else if (e instanceof DslParser.If) {
-            DslParser.If iff = (DslParser.If) e;
-            collectInFlowOrder(iff.thenBranch, out);
-            if (iff.elseBranch != null) {
-                collectInFlowOrder(iff.elseBranch, out);
-            }
+        NodeDef nd = e.defRef() == null ? null : node(e.defRef());
+        if (nd != null) {
+            out.add(nd);
+        }
+        for (DslParser.Expr child : e.children()) {
+            collectInFlowOrder(child, out);
         }
     }
 

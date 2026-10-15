@@ -12,7 +12,7 @@ import java.util.Map;
 
 /**
  * 统一门面: 对外只暴露一个入口, 组合 Plan / Execution / Intervention / Progress / Rollback。
- * 所有业务键为 varchar(20) 字符串(auto_id 物理主键不外露)。
+ * 所有业务键为 varchar(32) 字符串(auto_id 物理主键不外露)。
  *
  * 返回口径: 只创建不执行的(create)返 procInstId; **带执行的**(createAndStart / start)返
  * {@link ProcessExecution}(流程实例 id + 调用结束时的状态, 坏终态再附那一条失败摘要), 免调用方再查一次库;

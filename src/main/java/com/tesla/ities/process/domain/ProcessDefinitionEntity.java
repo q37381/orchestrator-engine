@@ -8,7 +8,7 @@ import java.time.LocalDateTime;
  */
 public class ProcessDefinitionEntity {
     private Long autoId;            // 物理主键
-    private String processDefId;    // 业务键 varchar(20)
+    private String processDefId;    // 业务键 varchar(32)
     private Integer version;
     private String name;
     private String definition;      // YAML/JSON 整棵树

@@ -15,14 +15,13 @@ import java.util.List;
  */
 public class NodeInstEntity {
     private Long autoId;          // 物理主键, 承载声明顺序
-    private String nodeInstId;    // 业务键 varchar(20)
+    private String nodeInstId;    // 业务键 varchar(32)
     private String procInstId;
     private String nodeDefId;     // 定义引用键(flow DSL 引用键; 匿名 PARALLEL/IF 无定义为 NULL); 与 action_inst.action_def_id 同族
     private String name;          // 展示名(物化期取 NodeDef.displayName, 未声明 name 即 nodeDefId; 匿名控制节点 NULL, 视图回落 nodeInstId)
     private String type;          // PARALLEL|IF|ACTION(控制/叶子由 type 区分, kind 已移除)
     private String parentId;      // 父节点业务键(顶层根为 NULL)
     private String status;
-    private Integer pending;      // join 计数(备用: 节点级认领路径用)
     private String errorPolicy;
     private Boolean shardEnabled;
     private String shardResolver;
@@ -94,12 +93,6 @@ public class NodeInstEntity {
     }
     public void setStatus(String v) {
         this.status = v;
-    }
-    public Integer getPending() {
-        return pending;
-    }
-    public void setPending(Integer v) {
-        this.pending = v;
     }
     public String getErrorPolicy() {
         return errorPolicy;

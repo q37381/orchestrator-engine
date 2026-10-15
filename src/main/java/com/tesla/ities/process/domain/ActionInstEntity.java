@@ -6,13 +6,14 @@ import java.time.LocalDateTime;
  *  name 是展示用列(物化期取 ActionDef.displayName, 未声明即 actionDefId), 与 node_inst.nodeDefId/name 同族, 视图直接读行展示。 */
 public class ActionInstEntity {
     private Long autoId;          // 物理主键, 单调递增 = 声明顺序
-    private String actionInstId;  // 业务键 varchar(20)
+    private String actionInstId;  // 业务键 varchar(32)
     private String nodeInstId;
     private String laneId;        // 非分片为 null
     private String actionDefId;   // 定义引用键(= ActionDef.id, 未声明 id 则 handler)
     private String name;          // 展示名(物化期取 ActionDef.displayName, 未声明即 actionDefId)
     private String handlerName;   // ActionHandler.name()
     private String shardKey;
+    private String segment;       // 执行段(setup|main|setdown, 小写规范值); 存量行/未设置按 main 计
     private String status;
     private String whenExpr;      // 声明式 guard
     private Integer visitCount;
@@ -70,6 +71,12 @@ public class ActionInstEntity {
     }
     public void setShardKey(String v) {
         this.shardKey = v;
+    }
+    public String getSegment() {
+        return segment;
+    }
+    public void setSegment(String v) {
+        this.segment = v;
     }
     public String getStatus() {
         return status;

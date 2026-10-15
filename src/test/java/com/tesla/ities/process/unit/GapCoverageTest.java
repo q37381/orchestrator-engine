@@ -6,11 +6,12 @@ import com.tesla.ities.process.core.define.NodeDef;
 import com.tesla.ities.process.core.define.ProcessDefinition;
 import com.tesla.ities.process.core.model.DefinitionStatus;
 import com.tesla.ities.process.core.model.RollbackStatus;
-import com.tesla.ities.process.util.IdGenerator;
 import com.tesla.ities.process.util.Json;
 import com.tesla.ities.process.exception.ProcessException;
 import org.junit.Assert;
 import org.junit.Test;
+import org.junit.runner.RunWith;
+import org.mockito.junit.MockitoJUnitRunner;
 
 import java.util.Collections;
 import java.util.LinkedHashMap;
@@ -18,8 +19,11 @@ import java.util.Map;
 
 /**
  * 若干孤立分支的收敛: JSON 序列化失败、枚举 of() 无匹配回落、NodeDef/ProcessDefinition 全访问器、
- * Context/ProcessContext 点号路径遇标量的降级、ActionContext 转换型 payload 的空校验、IdGenerator base62(0)。
+ * Context/ProcessContext 点号路径遇标量的降级、ActionContext 转换型 payload 的空校验。
+ *
+ * 本类没有可替身的协作者(全是定义/上下文/工具的纯逻辑), 被测对象直调即可。
  */
+@RunWith(MockitoJUnitRunner.class)
 public class GapCoverageTest {
 
     @Test
@@ -113,12 +117,5 @@ public class GapCoverageTest {
     public void actionContextTypedPayloadNullThrows() {
         new ActionContext(new ProcessContext("p"), "A", "d", null, null)
                 .shardPayload(MiscUnitTest.Bean.class);
-    }
-
-    @Test
-    public void idGeneratorBase62ZeroViaReflection() throws Exception {
-        java.lang.reflect.Method m = IdGenerator.class.getDeclaredMethod("base62", long.class);
-        m.setAccessible(true);
-        Assert.assertEquals("0", m.invoke(new IdGenerator(), 0L));
     }
 }

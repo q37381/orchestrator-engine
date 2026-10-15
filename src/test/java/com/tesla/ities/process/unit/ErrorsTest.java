@@ -3,6 +3,8 @@ package com.tesla.ities.process.unit;
 import com.tesla.ities.process.util.Errors;
 import org.junit.Assert;
 import org.junit.Test;
+import org.junit.runner.RunWith;
+import org.mockito.junit.MockitoJUnitRunner;
 
 import java.util.Collections;
 import java.util.LinkedHashMap;
@@ -12,7 +14,10 @@ import java.util.concurrent.ExecutionException;
 /**
  * {@link Errors} 的口径: 摘要一句含"语境(定位): 类名: 消息"、消息为 null 也不空、并发包装先拆、
  * 从 result 桶/JSON 都能读回那句(没记 = null)。
+ *
+ * 全是静态工具方法, 没有可替身的协作者, 本类只用统一的 {@code MockitoJUnitRunner} 口径跑。
  */
+@RunWith(MockitoJUnitRunner.class)
 public class ErrorsTest {
 
     @Test

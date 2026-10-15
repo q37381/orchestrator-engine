@@ -19,7 +19,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
  *  - 代价: owner 进程崩溃, 流程僵在 RUNNING, 需人工干预翻回 PENDING(心跳/lease 留作后续扩展)。
  * node/lane 级认领(跨机并行)作为备用方案保留在 Mapper, 默认不启用。
  *
- * 由 OrchestratorEngineConfig 以 @Bean 方式创建, 配置值构造时传入。
+ * 由 ProcessEngineConfig.orchestratorDispatcher 工厂方法创建, 配置值构造时传入
+ * (那条 {@code @Bean} 当前注释着: 需要主动调度的部署显式打开, 免得宿主一起容器就多出个后台线程)。
  */
 public class Dispatcher implements SmartInitializingSingleton {
 

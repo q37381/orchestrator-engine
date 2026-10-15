@@ -14,7 +14,7 @@ import java.util.Map;
 
 /**
  * 引擎端到端主链: 门面上进, 驱动整棵 flow, 覆盖
- * ExecutionEngine/NodeDriver/Materializer/LeafExprMaterializer/ActionStrategy/ParallelStrategy/IfStrategy/
+ * ExecutionEngine/NodeDriver/Materializer/ActionKind/ParallelKind/IfKind/GroupKind/
  * ContextFactory/DefinitionCache/PlanService/ProgressService/ProcessFacade 的正常与常见分支。
  *
  * 装配与替身见 {@link EngineE2ETestBase}(内存表 + Mockito, 不起容器)。defId 只在单个用例内有效,

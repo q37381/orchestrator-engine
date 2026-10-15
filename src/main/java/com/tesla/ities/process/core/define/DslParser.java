@@ -3,6 +3,7 @@ package com.tesla.ities.process.core.define;
 import com.tesla.ities.process.exception.ProcessException;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 
 /**
@@ -29,22 +30,128 @@ import java.util.List;
  */
 public final class DslParser {
 
-    public interface Expr {}
+    /**
+     * 表达式的**类型自述**(类型知识归类型自己, 不再由外部按 instanceof 分派)。四件事都在这里, 一处不漏:
+     *  - {@link #children()} 声明顺序的直接子表达式: 装载期校验/重写与驱动期走查都按它递归;
+     *  - {@link #defRef()} 指向 nodes 下声明的引用键: 对齐时据此挂 NodeDef(匿名容器无声明 = null);
+     *  - {@link #containerLabel()} 需要与 nodes 声明**配对校验**的容器命名后缀(只有命名并行是用户手敲的);
+     *  - {@link #appendFlow(StringBuilder)} 写回 DSL 文本(与 {@link #parseFlow} 互逆, 定义快照靠它)。
+     *
+     * 新增一种表达式 = 新增一个 Expr 实现并覆写这几条; 遍历/校验/渲染/取子项各处都不用再改
+     * (以前要动 5 条 instanceof 链, 漏一条就是"命名容器不认自己的声明"这种拖到运行期的坑)。
+     */
+    public interface Expr {
+
+        /** 声明顺序的直接子表达式(叶子恒为空列表, 不返回 null)。 */
+        List<Expr> children();
+
+        /** nodes 下的声明引用键(叶子 = nodeRef, 命名容器 = name); 匿名 PARALLEL/IF 无声明 = null。 */
+        String defRef();
+
+        /**
+         * 装载期必须与 nodes 声明成对的容器命名后缀: 只有**命名并行**是用户手敲的(拼错就静默回落全局策略, 所以当场拒,
+         * 见 DefinitionLoader.validateNamedParallels); GROUP 的名字来自 group 段展开或允许退化匿名, 叶子不是容器——都回 null。
+         */
+        default String containerLabel() {
+            return null;
+        }
+
+        /** 写回 flow DSL 片段(与 {@link #parseFlow} 互逆)。 */
+        void appendFlow(StringBuilder sb);
+    }
+
+    /**
+     * 装载期展开聚合节点时需要**按新子项原样重建**的容器表达式(并行/条件):
+     * 只换子项, 关键字、命名后缀与形状都必须一字不变(漏一项就是静默丢命名)。
+     * GROUP 不实现它——它本身就是 group 段的展开产物, 组内子项既不重绑定也不替换(见 DefinitionLoader)。
+     */
+    public interface ContainerExpr extends Expr {
+
+        /** 用新的子表达式重建本容器(子项个数与顺序由调用方保证与 {@link #children()} 对应)。 */
+        Expr withChildren(List<Expr> children);
+    }
 
     /**
      * 并行容器: 子表达式全部扇出并发, join 按 severity 聚合。
      * {@code name} 可空——空 = 匿名并行(无 NodeDef 可挂, 策略/guard 一律回落流程级全局);
      * 非空 = flow 里写在关键字后的命名后缀 {@code PARALLEL:名字(a,b)}, 指向 nodes 下的纯容器条目, 与 {@link Group} 同一个套路。
      */
-    public static final class Parallel implements Expr {
+    public static final class Parallel implements ContainerExpr {
         public String name;                          // 命名后缀给出的声明键; null = 匿名
         public final List<Expr> items = new ArrayList<>();
+
+        @Override public List<Expr> children() {
+            return items;
+        }
+
+        @Override public String defRef() {
+            return name;
+        }
+
+        @Override public String containerLabel() {
+            return name;                                   // 命名后缀是用户手敲的, 装载期要跟声明配对校验
+        }
+
+        @Override public Expr withChildren(List<Expr> children) {
+            Parallel out = new Parallel();
+            out.name = name;
+            out.items.addAll(children);
+            return out;
+        }
+
+        @Override public void appendFlow(StringBuilder sb) {
+            sb.append("PARALLEL");
+            if (name != null) {
+                sb.append(':').append(name);        // 命名后缀写回原样(括号之前), 保证 parseFlow ↔ toFlow 互逆
+            }
+            sb.append('(');
+            appendItems(sb, items);
+            sb.append(')');
+        }
     }
 
-    public static final class If implements Expr {
+    /**
+     * 条件容器: 两个分支都是**候选**子项(定义侧遍历两支都算), 运行期只驱动选中的那支。
+     * 无声明键(defRef = null): IF 写在 flow 里, 不占 nodes 下的一条声明, 条件文本落在 condition 上。
+     */
+    public static final class If implements ContainerExpr {
         public String condition;
         public Expr thenBranch;
         public Expr elseBranch;   // 可空
+
+        @Override public List<Expr> children() {
+            List<Expr> out = new ArrayList<>();
+            if (thenBranch != null) {
+                out.add(thenBranch);
+            }
+            if (elseBranch != null) {
+                out.add(elseBranch);
+            }
+            return out;
+        }
+
+        @Override public String defRef() {
+            return null;                                   // 匿名: 不吃 NodeDef
+        }
+
+        @Override public Expr withChildren(List<Expr> children) {
+            If out = new If();
+            out.condition = condition;
+            out.thenBranch = children.isEmpty() ? null : children.get(0);
+            out.elseBranch = children.size() > 1 ? children.get(1) : null;
+            return out;
+        }
+
+        @Override public void appendFlow(StringBuilder sb) {
+            // condition 由 readUntilCommaOrClose 取出, 本身不含顶层逗号, 故直接拼回不会破坏语法
+            sb.append("IF(").append(condition).append(',');
+            append(sb, thenBranch);
+            if (elseBranch != null) {
+                sb.append(',');
+                append(sb, elseBranch);
+            }
+            sb.append(')');
+        }
     }
 
     public static final class Leaf implements Expr {
@@ -53,15 +160,41 @@ public final class DslParser {
         public Leaf(String nodeRef) {
             this.nodeRef = nodeRef;
         }
+
+        @Override public List<Expr> children() {
+            return Collections.emptyList();                // 叶子没有子表达式(它下面的 lane/action 不是定义树的一层)
+        }
+
+        @Override public String defRef() {
+            return nodeRef;
+        }
+
+        @Override public void appendFlow(StringBuilder sb) {
+            sb.append(nodeRef);
+        }
     }
 
-    /** 聚合节点: 有名字的串行容器, 子表达式按声明顺序逐个驱动(组级共享靠显式放置, 见 GroupStrategy)。 */
+    /** 聚合节点: 有名字的串行容器, 子表达式按声明顺序逐个驱动(组级共享靠显式放置, 见 GroupKind)。 */
     public static final class Group implements Expr {
         public final String name;                        // nodes 下的声明键(= NodeDef.id); 恒非空(无名在解析期就 AU204102)
         public final List<Expr> items = new ArrayList<>();
 
         public Group(String name) {
             this.name = name;
+        }
+
+        @Override public List<Expr> children() {
+            return items;
+        }
+
+        @Override public String defRef() {
+            return name;
+        }
+
+        @Override public void appendFlow(StringBuilder sb) {
+            sb.append("GROUP:").append(name).append('(');
+            appendItems(sb, items);
+            sb.append(')');
         }
     }
 
@@ -223,37 +356,12 @@ public final class DslParser {
         }
     }
 
+    /** 写回单个表达式: 渲染知识在 Expr 自己身上(见 {@link Expr#appendFlow}), 这里只兜住 null。 */
     private static void append(StringBuilder sb, Expr e) {
-        if (e instanceof Leaf) {
-            sb.append(((Leaf) e).nodeRef);
-        } else if (e instanceof Parallel) {
-            Parallel p = (Parallel) e;
-            sb.append("PARALLEL");
-            if (p.name != null) {
-                sb.append(':').append(p.name);        // 命名后缀写回原样(括号之前), 保证 parseFlow ↔ toFlow 互逆
-            }
-            sb.append('(');
-            appendItems(sb, p.items);
-            sb.append(')');
-        } else if (e instanceof Group) {
-            Group g = (Group) e;
-            sb.append("GROUP:").append(g.name).append('(');
-            appendItems(sb, g.items);
-            sb.append(')');
-        } else if (e instanceof If) {
-            If iff = (If) e;
-            // condition 由 readUntilCommaOrClose 取出, 本身不含顶层逗号, 故直接拼回不会破坏语法
-            sb.append("IF(").append(iff.condition).append(',');
-            append(sb, iff.thenBranch);
-            if (iff.elseBranch != null) {
-                sb.append(',');
-                append(sb, iff.elseBranch);
-            }
-            sb.append(')');
-        } else {
-            throw new ProcessException("AU204104",
-                    e == null ? "null" : e.getClass().getSimpleName());
+        if (e == null) {
+            throw new ProcessException("AU204104", "null");
         }
+        e.appendFlow(sb);
     }
 
     private String readUntilCommaOrClose() {

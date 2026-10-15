@@ -9,6 +9,9 @@ import com.tesla.ities.process.exception.ProcessException;
 import com.tesla.ities.process.util.Json;
 import org.junit.Assert;
 import org.junit.Test;
+import org.junit.runner.RunWith;
+import org.mockito.InjectMocks;
+import org.mockito.junit.MockitoJUnitRunner;
 
 import java.util.List;
 
@@ -25,14 +28,19 @@ import java.util.List;
  *  3. **装载期配对**: 拼错的后缀、指向叶子节点的命名、声明了却没人引用的容器, 全部当场拒——
  *     "我明明设了策略却没生效"不该拖到运行期才发现。
  */
+@RunWith(MockitoJUnitRunner.class)
 public class NamedParallelTest {
 
-    private static ProcessDefinition load(String yaml) {
-        return new DefinitionLoader().load(yaml);
+    /** 装载器无协作者, 按 {@code @InjectMocks} 口径由 Mockito 造。 */
+    @InjectMocks
+    private DefinitionLoader loader;
+
+    private ProcessDefinition load(String yaml) {
+        return loader.load(yaml);
     }
 
     /** 装载必须炸, 且炸在预期的键上。 */
-    private static void assertLoadFails(String yaml, String key) {
+    private void assertLoadFails(String yaml, String key) {
         try {
             load(yaml);
             Assert.fail("应装载失败: " + yaml);

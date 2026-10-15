@@ -38,7 +38,7 @@ public final class ProcessExecution {
         this.error = error;
     }
 
-    /** 业务键 varchar(20): 后续进度查询/干预都用它。 */
+    /** 业务键 varchar(32): 后续进度查询/干预都用它。 */
     public String getProcInstId() {
         return procInstId;
     }
@@ -61,11 +61,6 @@ public final class ProcessExecution {
     /** 是否成功完成(SUCCESS 或 SKIPPED)。 */
     public boolean isSuccess() {
         return status != null && status.isCompletedOk();
-    }
-
-    /** 是否落到 FAILED。 */
-    public boolean isFailed() {
-        return status == Status.FAILED;
     }
 
     /** 流程行上那一条失败摘要(异常语境 + 定位 + 类名: 消息); 没失败/没读到 = null。 */

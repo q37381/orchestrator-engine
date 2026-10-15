@@ -8,7 +8,7 @@ import org.apache.ibatis.annotations.Param;
 import java.util.List;
 
 /**
- * process_inst 数据访问。SQL 见 resources/mapper/orchestrator/ProcessInstMapper.xml。
+ * process_inst 数据访问。SQL 见 resources/META-INF/mapper/process/ProcessInstMapper.xml。
  *
  * 精简说明: 原 casStatus / claim / updateResult / updateVars 四条语句只差"写哪几列",
  * 统一收进一条动态 {@link #updateState}(只写非 null 的列); 下面的语义快捷方法是 default,

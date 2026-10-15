@@ -2,9 +2,12 @@ package com.tesla.ities.process.unit;
 
 import com.tesla.ities.process.config.ProcessEngineConfig;
 import com.tesla.ities.process.core.engine.Dispatcher;
-import org.h2.jdbcx.JdbcDataSource;
 import org.junit.Assert;
 import org.junit.Test;
+import org.junit.runner.RunWith;
+import org.mockito.InjectMocks;
+import org.mockito.Mock;
+import org.mockito.junit.MockitoJUnitRunner;
 import org.mybatis.spring.SqlSessionFactoryBean;
 import org.mybatis.spring.mapper.MapperScannerConfigurer;
 import org.springframework.beans.factory.ObjectProvider;
@@ -21,8 +24,22 @@ import static org.mockito.Mockito.when;
 /**
  * 引擎配置类单测: 表名变量派生、可覆盖属性的 getter/setter、线程池/扫描器/调度器工厂方法、
  * SqlSessionFactory 的显式注入优先与上下文回退两条取值路径。
+ *
+ * 装配口径: 配置类本体 {@code @InjectMocks}(非 Spring 直接 new 时取字段 Java 初始值),
+ * 上下文与数据源 provider 是 {@code @Mock} 字段; DataSource 用 mock(只当值传, 不连库, 不绑具体实现)。
+ *
+ * 线程池断言口径: sizing 一律看**真身**(初始化后问底层 jdk 的 ThreadPoolExecutor), 不依赖 Spring 侧的 getter ——
+ * 宿主的 Spring 版本可能没有某个 getter(如 {@code getQueueCapacity()}), 而 jdk 那套 API 常年不变。
  */
+@RunWith(MockitoJUnitRunner.class)
 public class ProcessEngineConfigTest {
+
+    @Mock
+    private ApplicationContext context;
+    @Mock
+    private ObjectProvider<DataSource> dataSourceProvider;
+    @InjectMocks
+    private ProcessEngineConfig config;
 
     @Test
     public void buildTableVariablesDefaultPrefix() {
@@ -44,9 +61,9 @@ public class ProcessEngineConfigTest {
     }
 
     /**
-     * 自定义前缀: 7 张**一律** = 前缀 + 表名, 没有两张固定名特权(否则消费者库里正好有一张
+     * 自定义前缀: 8 张**一律** = 前缀 + 表名, 没有两张固定名特权(否则消费者库里正好有一张
      * process_inst 时无处可逃, 而 tablePrefix 存在的唯一理由就是撞名逃逸)。
-     * 空前缀那条用例则是同一规则的另一端: 七张一起回落到裸名。
+     * 空前缀那条用例则是同一规则的另一端: 八张一起回落到裸名。
      */
     @Test
     public void buildTableVariablesCustomPrefix() {
@@ -62,32 +79,31 @@ public class ProcessEngineConfigTest {
 
     @Test
     public void mutablePropertiesRoundTrip() {
-        ProcessEngineConfig c = new ProcessEngineConfig();
-        Assert.assertEquals("process_", c.getTablePrefix());
-        Assert.assertTrue(c.isDispatcherEnabled());
-        Assert.assertEquals(500L, c.getDispatcherPollIntervalMs());
-        Assert.assertEquals(16, c.getDispatcherClaimBatch());
+        Assert.assertEquals("process_", config.getTablePrefix());
+        Assert.assertTrue(config.isDispatcherEnabled());
+        Assert.assertEquals(500L, config.getDispatcherPollIntervalMs());
+        Assert.assertEquals(16, config.getDispatcherClaimBatch());
 
-        c.setTablePrefix("t_");
-        c.setDispatcherEnabled(false);
-        c.setDispatcherPollIntervalMs(99L);
-        c.setDispatcherClaimBatch(3);
-        DataSource ds = new JdbcDataSource();
-        c.setDataSource(ds);
+        config.setTablePrefix("t_");
+        config.setDispatcherEnabled(false);
+        config.setDispatcherPollIntervalMs(99L);
+        config.setDispatcherClaimBatch(3);
+        DataSource ds = mock(DataSource.class);
+        config.setDataSource(ds);
 
-        Assert.assertEquals("t_", c.getTablePrefix());
-        Assert.assertFalse(c.isDispatcherEnabled());
-        Assert.assertEquals(99L, c.getDispatcherPollIntervalMs());
-        Assert.assertEquals(3, c.getDispatcherClaimBatch());
-        Assert.assertSame(ds, c.getDataSource());
+        Assert.assertEquals("t_", config.getTablePrefix());
+        Assert.assertFalse(config.isDispatcherEnabled());
+        Assert.assertEquals(99L, config.getDispatcherPollIntervalMs());
+        Assert.assertEquals(3, config.getDispatcherClaimBatch());
+        Assert.assertSame(ds, config.getDataSource());
     }
 
     @Test
     public void parallelExecutePoolBeanIsConfigured() {
-        ThreadPoolTaskExecutor ex = new ProcessEngineConfig().itiesProcessParallelExecutePool();
+        ThreadPoolTaskExecutor ex = config.itiesProcessParallelExecutePool();
         Assert.assertEquals(16, ex.getCorePoolSize());
         Assert.assertEquals(16, ex.getMaxPoolSize());
-        Assert.assertEquals(20000, ex.getQueueCapacity());
+        Assert.assertEquals(20000, queueCapacity(ex));
         Assert.assertEquals("ities-process-node-", ex.getThreadNamePrefix());
         ex.shutdown();
     }
@@ -95,14 +111,13 @@ public class ProcessEngineConfigTest {
     /** 三档池默认同规格(16/16/20000/600), 但前缀各自独立便于日志区分; sizing 走 @Value, 非 Spring 直接 new 时取字段初始值。 */
     @Test
     public void threePoolsShareDefaultsButDistinctPrefixes() {
-        ProcessEngineConfig c = new ProcessEngineConfig();
-        ThreadPoolTaskExecutor node = c.itiesProcessParallelExecutePool();
-        ThreadPoolTaskExecutor shard = c.itiesProcessActionShardParallelExecutePool();
-        ThreadPoolTaskExecutor action = c.itiesProcessActionParallelExecutePool();
+        ThreadPoolTaskExecutor node = config.itiesProcessParallelExecutePool();
+        ThreadPoolTaskExecutor shard = config.itiesProcessActionShardParallelExecutePool();
+        ThreadPoolTaskExecutor action = config.itiesProcessActionParallelExecutePool();
         for (ThreadPoolTaskExecutor ex : new ThreadPoolTaskExecutor[]{node, shard, action}) {
             Assert.assertEquals(16, ex.getCorePoolSize());
             Assert.assertEquals(16, ex.getMaxPoolSize());
-            Assert.assertEquals(20000, ex.getQueueCapacity());
+            Assert.assertEquals(20000, queueCapacity(ex));
             Assert.assertEquals(600, ex.getKeepAliveSeconds());
         }
         Assert.assertEquals("ities-process-node-", node.getThreadNamePrefix());
@@ -113,41 +128,48 @@ public class ProcessEngineConfigTest {
         action.shutdown();
     }
 
+    /**
+     * 队列容量的取法: Spring 那侧的 {@code getQueueCapacity()} 不是每个版本都有(宿主那份就没有),
+     * 所以先 {@code initialize()} 再问底层 jdk 线程池的空队列还剩多少坑——等价于设进去的容量,
+     * 且验的是真正生效的那条队列, 不是配置字段本身。底层 API 是 jdk 的, 换 Spring 版本也测得出真值。
+     */
+    private static int queueCapacity(ThreadPoolTaskExecutor ex) {
+        ex.initialize();
+        return ex.getThreadPoolExecutor().getQueue().remainingCapacity();
+    }
+
     @Test
     public void mapperScannerTargetsEnginePackage() {
-        MapperScannerConfigurer scanner = new ProcessEngineConfig().orchestratorMapperScanner();
+        MapperScannerConfigurer scanner = config.orchestratorMapperScanner();
         Assert.assertNotNull(scanner);
     }
 
     @Test
     public void dispatcherFactoryWiresGivenConfig() {
-        ProcessEngineConfig c = new ProcessEngineConfig();
-        c.setDispatcherEnabled(false);
-        Dispatcher d = c.orchestratorDispatcher(null, null, new ProcessEngineConfig().itiesProcessParallelExecutePool());
+        config.setDispatcherEnabled(false);
+        ThreadPoolTaskExecutor pool = config.itiesProcessParallelExecutePool();
+        Dispatcher d = config.orchestratorDispatcher(null, null, pool);
         Assert.assertNotNull(d);
+        pool.shutdown();
     }
 
     /** 显式注入 DataSource 优先: 不触碰 ApplicationContext。 */
     @Test
     public void sqlSessionFactoryPrefersExplicitDataSource() throws Exception {
-        ProcessEngineConfig c = new ProcessEngineConfig();
-        c.setDataSource(new JdbcDataSource());
-        SqlSessionFactoryBean factory = c.processSqlSessionFactory(null);
+        config.setDataSource(mock(DataSource.class));
+        SqlSessionFactoryBean factory = config.processSqlSessionFactory(null);
         Assert.assertNotNull(factory);
     }
 
     /** 未显式注入时回退到上下文里唯一的数据源(mock 上下文, 不起容器)。 */
     @Test
-    @SuppressWarnings("unchecked")
     public void sqlSessionFactoryFallsBackToContextDataSource() throws Exception {
-        DataSource ds = new JdbcDataSource();
-        ObjectProvider<DataSource> provider = mock(ObjectProvider.class);
-        when(provider.getIfAvailable()).thenReturn(ds);
-        ApplicationContext ctx = mock(ApplicationContext.class);
-        when(ctx.getBeanProvider(DataSource.class)).thenReturn(provider);
+        when(dataSourceProvider.getIfAvailable()).thenReturn(mock(DataSource.class));
+        when(context.getBeanProvider(DataSource.class)).thenReturn(dataSourceProvider);
 
-        SqlSessionFactoryBean factory = new ProcessEngineConfig().processSqlSessionFactory(ctx);
+        SqlSessionFactoryBean factory = config.processSqlSessionFactory(context);
         Assert.assertNotNull(factory);
-        verify(ctx).getBeanProvider(DataSource.class);      // 取值路径确实走了上下文 provider
+        verify(context).getBeanProvider(DataSource.class);      // 取值路径确实走了上下文 provider
+        verify(dataSourceProvider).getIfAvailable();
     }
 }

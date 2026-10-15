@@ -5,6 +5,7 @@ import com.tesla.ities.process.core.define.ProcessDefinition;
 import com.tesla.ities.process.core.runtime.ContextFactory;
 import com.tesla.ities.process.core.runtime.DefinitionCache;
 import com.tesla.ities.process.core.runtime.VariableResolver;
+import com.tesla.ities.process.core.model.ActionSegment;
 import com.tesla.ities.process.core.model.RollbackStatus;
 import com.tesla.ities.process.core.model.Status;
 import com.tesla.ities.process.core.spi.ActionHandler;
@@ -66,12 +67,14 @@ public class RollbackService {
     private final DefinitionCache defCache;
     private final VariableResolver resolver;
     private final IdGenerator ids;
+    private final ConfigFreeze freeze;
 
     public RollbackService(ProcessInstMapper processMapper, NodeInstMapper nodeMapper, LaneMapper laneMapper,
                            ActionInstMapper actionMapper, RollbackRecordMapper rollbackMapper,
                            ActionHandlerRegistry handlers,
                            ContextFactory ctxFactory, ListenerEngine listeners,
-                           DefinitionCache defCache, VariableResolver resolver, IdGenerator ids) {
+                           DefinitionCache defCache, VariableResolver resolver, IdGenerator ids,
+                           ConfigFreeze freeze) {
         this.processMapper = processMapper;
         this.nodeMapper = nodeMapper;
         this.laneMapper = laneMapper;
@@ -83,6 +86,7 @@ public class RollbackService {
         this.defCache = defCache;
         this.resolver = resolver;
         this.ids = ids;
+        this.freeze = freeze;
     }
 
     /** 逆序补偿整个流程已成功的 action。每个补偿步骤写一行 rollback_record(关联原 action_inst)。 */
@@ -152,8 +156,7 @@ public class RollbackService {
                 ActionContext actx = ctxFactory.action(parent, a, payload);
 
                 // 激活期解析(与 NodeDriver.runAction 同口径): 让 ${result.*} / 运行期 vars / 回退前置现取的值可用
-                actx.replaceConfig(Materializer.asMap(
-                        resolver.resolve(Json.readMap(a.getConfig()), actx, VariableResolver.Phase.ACTIVATION)));
+                actx.replaceConfig(freeze.freezeActivation(resolver, actx, Json.readMap(a.getConfig())));
                 List<String> pending = resolver.findUnresolved(actx.config());
                 if (!pending.isEmpty()) {
                     log.warn("补偿 config 仍含未解析占位符 proc={} action={} keys={}",
@@ -220,17 +223,22 @@ public class RollbackService {
         return Json.write(m);
     }
 
-    /** 收集已成功 action, 逆序(auto_id 降序 = 声明/执行逆序)。 */
+    /**
+     * 收集"已成功且在主段(segment=main)"的 action, 按 auto_id 降序(逆序补偿的依据)。
+     * setup/setdown 段行**不参与**回退: 段动作多为"暂停/恢复"这类不可补偿的编排辅助(compensable()=false),
+     * 若纳入, 遇不可补偿即 blocked 会断掉每一次回退(FR-RBK-03); 需要被撤销的动作请放主段。
+     */
     private List<ActionInstEntity> collectSucceededActionsDesc(String procInstId) {
+        String main = ActionSegment.MAIN.getStatus();
         List<ActionInstEntity> result = new ArrayList<>();
         for (NodeInstEntity n : allNodes(procInstId)) {
-            for (ActionInstEntity a : actionMapper.findInContainer(n.getNodeInstId(), null)) {
+            for (ActionInstEntity a : actionMapper.findInContainer(n.getNodeInstId(), null, null, main)) {
                 if (Status.SUCCESS.getStatus().equals(a.getStatus())) {
                     result.add(a);
                 }
             }
             for (LaneEntity l : laneMapper.findByNode(n.getNodeInstId())) {
-                for (ActionInstEntity a : actionMapper.findInContainer(n.getNodeInstId(), l.getLaneId())) {
+                for (ActionInstEntity a : actionMapper.findInContainer(n.getNodeInstId(), l.getLaneId(), null, main)) {
                     if (Status.SUCCESS.getStatus().equals(a.getStatus())) {
                         result.add(a);
                     }

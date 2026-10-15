@@ -7,25 +7,27 @@ import com.tesla.ities.process.core.context.NodeContext;
 import com.tesla.ities.process.core.context.ProcessContext;
 import com.tesla.ities.process.core.define.DefinitionLoader;
 import com.tesla.ities.process.core.define.ProcessDefinition;
-import com.tesla.ities.process.core.engine.ActionStrategy;
+import com.tesla.ities.process.core.engine.ActionKind;
+import com.tesla.ities.process.core.engine.ActionRunner;
+import com.tesla.ities.process.core.engine.ConfigFreeze;
 import com.tesla.ities.process.core.engine.ExecutionEngine;
-import com.tesla.ities.process.core.engine.ExprMaterializer;
-import com.tesla.ities.process.core.engine.GroupExprMaterializer;
-import com.tesla.ities.process.core.engine.GroupStrategy;
-import com.tesla.ities.process.core.engine.IfExprMaterializer;
-import com.tesla.ities.process.core.engine.IfStrategy;
+import com.tesla.ities.process.core.engine.GroupKind;
+import com.tesla.ities.process.core.engine.IfKind;
 import com.tesla.ities.process.core.engine.InterventionService;
-import com.tesla.ities.process.core.engine.LeafExprMaterializer;
+import com.tesla.ities.process.core.engine.LayerWalker;
 import com.tesla.ities.process.core.engine.ListenerEngine;
 import com.tesla.ities.process.core.engine.Materializer;
 import com.tesla.ities.process.core.engine.NodeDriver;
-import com.tesla.ities.process.core.engine.NodeStrategy;
+import com.tesla.ities.process.core.engine.NodeKind;
+import com.tesla.ities.process.core.engine.NodeKinds;
 import com.tesla.ities.process.core.engine.ObserverEngine;
-import com.tesla.ities.process.core.engine.ParallelExprMaterializer;
-import com.tesla.ities.process.core.engine.ParallelStrategy;
+import com.tesla.ities.process.core.engine.ParallelKind;
 import com.tesla.ities.process.core.engine.PlanService;
+import com.tesla.ities.process.core.engine.ProcessStateFlusher;
 import com.tesla.ities.process.core.engine.ProgressService;
+import com.tesla.ities.process.core.engine.RestoreService;
 import com.tesla.ities.process.core.engine.RollbackService;
+import com.tesla.ities.process.core.model.ActionSegment;
 import com.tesla.ities.process.core.model.DefinitionStatus;
 import com.tesla.ities.process.core.model.Status;
 import com.tesla.ities.process.core.runtime.CancellationRegistry;
@@ -146,12 +148,16 @@ public abstract class EngineE2ETestBase {
 
         VariableResolver resolver = new VariableResolver();
         ConditionEvaluator evaluator = new ConditionEvaluator(resolver);
-        IdGenerator ids = new IdGenerator();
+        // 业务键生成器替身: 引擎只问 IdGenerator 要号(号源在宿主那边), 这里给一串本用例内唯一的键即可
+        IdGenerator ids = mock(IdGenerator.class);
+        final AtomicInteger keySeq = new AtomicInteger();
+        when(ids.next(any())).thenAnswer(inv -> "K" + keySeq.incrementAndGet());
         DefinitionLoader loader = new DefinitionLoader();
 
         ActionHandlerRegistry handlers = new ActionHandlerRegistry(Arrays.asList(
                 ok(), thrower(), skipper(), nuller(), varWriter(), flagTrue(), echoConfig(), placeToGroup(),
-                compOk(), compDefault(), compFail(), nonComp(), dbMigrate(), stopper(), flaky()));
+                compOk(), compDefault(), compFail(), nonComp(), dbMigrate(), stopper(), flaky(),
+                restoreFail(), flakyRestore(), pendingOnce(), pausedOnce(), suspended(), runningReturn()));
         ShardResolverRegistry shardResolvers = new ShardResolverRegistry(
                 Collections.singletonList(dbTopology()));
         ProcessListenerRegistry processListeners = new ProcessListenerRegistry(
@@ -172,26 +178,32 @@ public abstract class EngineE2ETestBase {
         DefinitionCache defCache = new DefinitionCache(defMapper, processMapper, loader);
         CancellationRegistry cancellation = new CancellationRegistry(processMapper);
 
-        LeafExprMaterializer leafMaterializer = new LeafExprMaterializer(
-                nodeMapper, laneMapper, actionMapper, shardResolvers, ids);
-        List<ExprMaterializer> materializers = Arrays.asList(
-                leafMaterializer, new IfExprMaterializer(nodeMapper, ids), new ParallelExprMaterializer(nodeMapper, ids),
-                new GroupExprMaterializer(nodeMapper, ids));
-        Materializer materializer = new Materializer(nodeMapper, materializers);
+        // 一种节点类型一份档案(与生产装配同口径): 一次注册进 NodeKinds, 物化按表达式分发、驱动按行 type 分发
+        ConfigFreeze freeze = new ConfigFreeze();
+        ActionKind actionKind = new ActionKind(nodeMapper, laneMapper, actionMapper, shardResolvers, ids, freeze);
+        NodeKinds nodeKinds = new NodeKinds(Arrays.asList(
+                actionKind, new IfKind(nodeMapper, ids), new ParallelKind(nodeMapper, ids, freeze),
+                new GroupKind(nodeMapper, ids, freeze)));
+        Materializer materializer = new Materializer(nodeMapper, nodeKinds);
+        ProcessStateFlusher flusher = new ProcessStateFlusher(processMapper);
 
-        List<NodeStrategy> strategies = Arrays.asList(
-                new ActionStrategy(leafMaterializer, shardPool),
-                new IfStrategy(nodeMapper, materializer),
-                new ParallelStrategy(materializer, nodePool),
-                new GroupStrategy(materializer));
-        NodeDriver driver = new NodeDriver(nodeMapper, laneMapper, actionMapper, processMapper,
-                handlers, listenerEngine, observerEngine, ctxFactory, cancellation, leafMaterializer, actionPool, strategies);
+        // 走查引擎(与生产装配同口径): 三档池 + action 行定位(口径归 ActionKind) + 容器行收尾(node/lane mapper)
+        LayerWalker walker = new LayerWalker(nodePool, shardPool, actionPool, actionKind, ctxFactory,
+                nodeMapper, laneMapper);
+
+        ActionRunner actionRunner = new ActionRunner(actionMapper,
+                handlers, listenerEngine, observerEngine, ctxFactory, cancellation, freeze, flusher);
+        NodeDriver driver = new NodeDriver(nodeMapper, listenerEngine, observerEngine, ctxFactory,
+                cancellation, materializer, actionRunner, nodeKinds, walker);
 
         RollbackService rollbackService = new RollbackService(processMapper, nodeMapper, laneMapper, actionMapper,
-                rollbackMapper, handlers, ctxFactory, listenerEngine, defCache, resolver, ids);
+                rollbackMapper, handlers, ctxFactory, listenerEngine, defCache, resolver, ids, freeze);
+        // 向前重放(回退后重试驱动前恢复现场): 与回退共用同一批 handler/上下文工厂, 但不牵监听器
+        RestoreService restoreService = new RestoreService(processMapper, nodeMapper, laneMapper, actionMapper,
+                rollbackMapper, handlers, ctxFactory, resolver, ids, freeze);
         // 自动回退(定义顶层 autoRollback)由引擎收尾直接调 RollbackService, 所以它与门面用的是**同一个**实例
         engine = new ExecutionEngine(processMapper, listenerEngine, observerEngine, defCache, ctxFactory,
-                driver, resolver, evaluator, materializer, rollbackService);
+                driver, resolver, evaluator, flusher, rollbackService, restoreService);
         PlanService planService = new PlanService(processMapper, defMapper, defCache, materializer,
                 ctxFactory, resolver, evaluator, ids);
         facade = new ProcessFacade(planService, engine,
@@ -326,7 +338,7 @@ public abstract class EngineE2ETestBase {
             case "findById":
                 return db.findAction((String) a[0]);
             case "findInContainer":
-                return db.findActions((String) a[0], (String) a[1], (String) a[2]);
+                return db.findActions((String) a[0], (String) a[1], (String) a[2], (String) a[3]);
             case "find":
                 return db.findActionsAny((String) a[0], (String) a[1]);
             case "updateState":
@@ -430,6 +442,7 @@ public abstract class EngineE2ETestBase {
     private ActionHandler compOk() throws Exception {
         ActionHandler h = compensable("compOk", true);
         doAnswer(i -> rec.order.add("compensate:compOk")).when(h).compensate(any());
+        doAnswer(i -> rec.order.add("restore:compOk")).when(h).restore(any());
         return h;
     }
 
@@ -443,6 +456,32 @@ public abstract class EngineE2ETestBase {
         doAnswer(i -> {
             throw new IllegalStateException("compensate boom");
         }).when(h).compensate(any());
+        return h;
+    }
+
+    /** 可补偿、补偿默认空实现即成功, 但 restore 恒抛: 验证"重放失败当场挂起、不向前驱动"。 */
+    private ActionHandler restoreFail() throws Exception {
+        ActionHandler h = compensable("restoreFail", true);
+        doAnswer(i -> {
+            throw new IllegalStateException("restore boom");
+        }).when(h).restore(any());
+        return h;
+    }
+
+    /**
+     * 可补偿, restore 头一次抛、之后成功(每个用例一套新装配, 计数天然独立):
+     * 验证"重放失败挂起 -> 修好现场再重试 -> 从没立稳那条接着放"的可重复闭环。
+     */
+    private ActionHandler flakyRestore() throws Exception {
+        ActionHandler h = compensable("flakyRestore", true);
+        AtomicInteger tries = new AtomicInteger();
+        doAnswer(i -> {
+            rec.order.add("restore:flakyRestore");
+            if (tries.getAndIncrement() == 0) {
+                throw new IllegalStateException("restore flaky boom");
+            }
+            return null;
+        }).when(h).restore(any());
         return h;
     }
 
@@ -478,6 +517,38 @@ public abstract class EngineE2ETestBase {
             }
             return Status.SUCCESS;
         });
+    }
+
+    /** 让渡(待重入): 首次返回 PENDING(退出等重入), 重入后成功——验证"让渡行重跑 + 完成后收尾"。 */
+    private ActionHandler pendingOnce() throws Exception {
+        AtomicInteger attempts = new AtomicInteger();
+        return handler("pendingOnce", ctx -> {
+            ctx.putResult("attempts", attempts.incrementAndGet());
+            rec.order.add("handler:pendingOnce:" + ctx.actionDefId());
+            return attempts.get() == 1 ? Status.PENDING : Status.SUCCESS;
+        });
+    }
+
+    /** 让渡(暂停): 首次返回 PAUSED, 走 resume 重新入队后成功。 */
+    private ActionHandler pausedOnce() throws Exception {
+        AtomicInteger attempts = new AtomicInteger();
+        return handler("pausedOnce", ctx -> {
+            rec.order.add("handler:pausedOnce:" + ctx.actionDefId());
+            return attempts.incrementAndGet() == 1 ? Status.PAUSED : Status.SUCCESS;
+        });
+    }
+
+    /** 让渡(挂起): 恒返 SUSPENDED(停驻态, 本期无唤醒入口)。 */
+    private ActionHandler suspended() throws Exception {
+        return handler("suspended", ctx -> {
+            rec.order.add("handler:suspended:" + ctx.actionDefId());
+            return Status.SUSPENDED;
+        });
+    }
+
+    /** 非法过程态: 返回 RUNNING -> 引擎按 FAILED 处理并写明 __error。 */
+    private ActionHandler runningReturn() throws Exception {
+        return handler("runningReturn", ctx -> Status.RUNNING);
     }
 
     /**
@@ -643,7 +714,7 @@ public abstract class EngineE2ETestBase {
         doAnswer(i -> {
             ProcessContext ctx = i.getArgument(0);
             rec.order.add("rollbackBefore");
-            ctx.putResult("dbConn", "jdbc:h2:mem");   // 现场信息(回退路径不刷流程级 result)
+            ctx.putResult("dbConn", "jdbc:mysql://db-01:3306/ord");   // 现场信息(回退路径不刷流程级 result)
             ctx.putVar("rollbackMarker", "1");
             return null;
         }).when(l).before(any(), any());
@@ -966,7 +1037,8 @@ public abstract class EngineE2ETestBase {
                     return 0;
                 }
                 if (e.getShardKey() != null && row.getNodeInstId().equals(e.getNodeInstId())
-                        && row.getActionDefId().equals(e.getActionDefId()) && eq(row.getShardKey(), e.getShardKey())) {
+                        && row.getActionDefId().equals(e.getActionDefId()) && eq(row.getShardKey(), e.getShardKey())
+                        && segmentOf(row).equals(segmentOf(e))) {
                     return 0;
                 }
             }
@@ -987,13 +1059,16 @@ public abstract class EngineE2ETestBase {
         }
 
         /** 容器内 action: laneId=null 匹配 lane_id IS NULL 的非分片行; actionDefId 非 null 只取一条。 */
-        synchronized List<ActionInstEntity> findActions(String nodeInstId, String laneId, String actionDefId) {
+        synchronized List<ActionInstEntity> findActions(String nodeInstId, String laneId, String actionDefId, String segment) {
             List<ActionInstEntity> out = new ArrayList<>();
             for (ActionInstEntity row : ordered(actions)) {
                 if (!row.getNodeInstId().equals(nodeInstId)) {
                     continue;
                 }
                 if (laneId == null ? row.getLaneId() != null : !laneId.equals(row.getLaneId())) {
+                    continue;
+                }
+                if (segment != null && !segment.equals(segmentOf(row))) {
                     continue;
                 }
                 if (actionDefId != null && !actionDefId.equals(row.getActionDefId())) {
@@ -1005,6 +1080,11 @@ public abstract class EngineE2ETestBase {
                 }
             }
             return out;
+        }
+
+        /** 段值口径: 未设置按 main 计(与真实库经 segment 列默认值落 main 同口径)。 */
+        private static String segmentOf(ActionInstEntity row) {
+            return row.getSegment() == null ? ActionSegment.MAIN.getStatus() : row.getSegment();
         }
 
         /** 不按 lane 收窄的 action 列表查询(两个条件都可选)。 */
