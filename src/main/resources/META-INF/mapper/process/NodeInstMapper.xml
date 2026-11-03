@@ -5,9 +5,9 @@
   findByParent 合并了原 findRoots / findChildren(parentId=null 即顶层根)。
   updateState 合并了原 casStatus / setStatus / markRunning / activate / updateStatusResult / updateConfig。
 -->
-<mapper namespace="com.tesla.ities.process.mapper.NodeInstMapper">
+<mapper namespace="com.tt.ii.process.mapper.NodeInstMapper">
 
-    <resultMap id="BaseResultMap" type="com.tesla.ities.process.domain.NodeInstEntity">
+    <resultMap id="BaseResultMap" type="com.tt.ii.process.domain.NodeInstEntity">
         <id     property="autoId"         column="auto_id"/>
         <id     property="nodeInstId"     column="node_inst_id"/>
         <result property="procInstId"     column="proc_inst_id"/>
@@ -34,10 +34,11 @@
         config, result, creator_id, updator_id, created_at, updated_at
     </sql>
 
-    <!-- 幂等物化: 命中唯一键则忽略(崩溃后重放不重复插)。creator_id = 流程创建人(建行人)。
+    <!-- 实例行插入: 幂等由物化侧保证(行↔表达式按 auto_id 下标对齐, 缺行才建), 这里不用 INSERT IGNORE——
+         IGNORE 会把唯一键冲突/列约束错误一律降级成警告, 出错时无从定位。creator_id = 流程创建人(建行人)。
          node_def_id/name 是展示用定义快照(物化期烙一次, 驱动期不刷)。 -->
-    <insert id="insertIgnore" parameterType="com.tesla.ities.process.domain.NodeInstEntity">
-        INSERT IGNORE INTO ${orch.table.nodeInst}(node_inst_id, proc_inst_id, node_def_id, name, type, parent_id, status,
+    <insert id="insert" parameterType="com.tt.ii.process.domain.NodeInstEntity">
+        INSERT INTO ${orch.table.nodeInst}(node_inst_id, proc_inst_id, node_def_id, name, type, parent_id, status,
                                       error_policy, shard_enabled, shard_resolver, condition_expr, config,
                                       creator_id, updator_id)
         VALUES(#{nodeInstId}, #{procInstId}, #{nodeDefId}, #{name}, #{type}, #{parentId}, #{status},

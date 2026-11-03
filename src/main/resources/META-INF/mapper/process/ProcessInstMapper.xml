@@ -7,9 +7,9 @@
   审计列: creator_id 只在插入时写(= 创建流程时传入的 userId); updator_id 由调用方从上下文显式下传
   给 updateState(驱动期=流程创建人, 干预期=操作人; null = 不刷, 保留原值)。
 -->
-<mapper namespace="com.tesla.ities.process.mapper.ProcessInstMapper">
+<mapper namespace="com.tt.ii.process.mapper.ProcessInstMapper">
 
-    <resultMap id="BaseResultMap" type="com.tesla.ities.process.domain.ProcessInstEntity">
+    <resultMap id="BaseResultMap" type="com.tt.ii.process.domain.ProcessInstEntity">
         <id     property="autoId"       column="auto_id"/>
         <id     property="procInstId"   column="proc_inst_id"/>
         <result property="processDefId" column="process_def_id"/>
@@ -29,8 +29,8 @@
         config, vars, result, creator_id, updator_id, created_at, updated_at
     </sql>
 
-    <!-- config = 创建输入(与其他层同名同语义), 只在插入时写一次; params 桶不落库。 -->
-    <insert id="insert" parameterType="com.tesla.ities.process.domain.ProcessInstEntity">
+    <!-- config 默认只在插入时写一次; 仅 settleOnStop 两阶段停止的标识(__stopRequested)会二次写/清。 -->
+    <insert id="insert" parameterType="com.tt.ii.process.domain.ProcessInstEntity">
         INSERT INTO ${orch.table.processInst}(proc_inst_id, process_def_id, def_version, status, config, vars, result, creator_id, updator_id)
         VALUES(#{procInstId}, #{processDefId}, #{defVersion}, #{status}, #{config}, #{vars}, #{result}, #{creatorId}, #{updatorId})
     </insert>
@@ -46,6 +46,7 @@
         UPDATE ${orch.table.processInst}
         <set>
             <if test="toStatus  != null">status = #{toStatus},</if>
+            <if test="config    != null">config = #{config},</if>
             <if test="result    != null">result = #{result},</if>
             <if test="vars      != null">vars = #{vars},</if>
             <if test="updatorId != null">updator_id = #{updatorId},</if>

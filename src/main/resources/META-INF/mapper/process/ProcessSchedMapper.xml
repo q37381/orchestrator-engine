@@ -6,9 +6,9 @@
   表名经 ${orch.table.*} 变量装载期替换(ProcessEngineConfig.tablePrefix 可改命名空间)。
   审计列: creator_id 只在插入时写; updator_id 由调用方显式下传(null = 不刷, 保留原值)。
 -->
-<mapper namespace="com.tesla.ities.process.mapper.ProcessSchedMapper">
+<mapper namespace="com.tt.ii.process.mapper.ProcessSchedMapper">
 
-    <resultMap id="BaseResultMap" type="com.tesla.ities.process.domain.ProcessSchedEntity">
+    <resultMap id="BaseResultMap" type="com.tt.ii.process.domain.ProcessSchedEntity">
         <id     property="autoId"     column="auto_id"/>
         <id     property="procInstId" column="proc_inst_id"/>
         <result property="schedUnit"  column="sched_unit"/>
@@ -24,7 +24,7 @@
         creator_id, updator_id, created_at, updated_at
     </sql>
 
-    <insert id="insert" parameterType="com.tesla.ities.process.domain.ProcessSchedEntity">
+    <insert id="insert" parameterType="com.tt.ii.process.domain.ProcessSchedEntity">
         INSERT INTO ${orch.table.processSched}(proc_inst_id, sched_unit, sched_zone, creator_id, updator_id)
         VALUES(#{procInstId}, #{schedUnit}, #{schedZone}, #{creatorId}, #{updatorId})
     </insert>

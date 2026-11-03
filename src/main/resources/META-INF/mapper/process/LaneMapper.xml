@@ -5,9 +5,9 @@
   findByNode 合并了原 findByNode / findByNodeAndShard(shardKey 非 null 时按唯一键 uk_node_shard 只取一条)。
   updateState 合并了原 setStatus / casStatus / activate / updateStatusResult / updateResult。
 -->
-<mapper namespace="com.tesla.ities.process.mapper.LaneMapper">
+<mapper namespace="com.tt.ii.process.mapper.LaneMapper">
 
-    <resultMap id="BaseResultMap" type="com.tesla.ities.process.domain.LaneEntity">
+    <resultMap id="BaseResultMap" type="com.tt.ii.process.domain.LaneEntity">
         <id     property="autoId"       column="auto_id"/>
         <id     property="laneId"       column="lane_id"/>
         <result property="procInstId"   column="proc_inst_id"/>
@@ -28,9 +28,10 @@
         error_policy, config, result, creator_id, updator_id, created_at, updated_at
     </sql>
 
-    <!-- 幂等物化: 命中 uk_node_shard 则忽略。creator_id = 流程创建人(建行人)。 -->
-    <insert id="insertIgnore" parameterType="com.tesla.ities.process.domain.LaneEntity">
-        INSERT IGNORE INTO ${orch.table.lane}(lane_id, proc_inst_id, node_inst_id, shard_key, status, error_policy, config, creator_id, updator_id)
+    <!-- lane 行插入: 幂等由物化侧的 find-or-create(findByNodeAndShard 先查)保证, 这里不用 INSERT IGNORE——
+         IGNORE 会把唯一键冲突/列约束错误静默成警告。creator_id = 流程创建人(建行人)。 -->
+    <insert id="insert" parameterType="com.tt.ii.process.domain.LaneEntity">
+        INSERT INTO ${orch.table.lane}(lane_id, proc_inst_id, node_inst_id, shard_key, status, error_policy, config, creator_id, updator_id)
         VALUES(#{laneId}, #{procInstId}, #{nodeInstId}, #{shardKey}, #{status}, #{errorPolicy}, #{config}, #{creatorId}, #{updatorId})
     </insert>
 

@@ -1,0 +1,270 @@
+# ============================================================================
+#  orchestrator-engine 流程定义完整模板 —— 覆盖全部编排特性, 可直接裁剪成业务定义
+#
+#  四层"前置/收尾"(名字同、心智同、载体不同):
+#    流程级   setup:/setdown:   值 = **节点引用列表**(整条流程的头尾; 只准叶子, 容器报 AU204202/203)
+#    组级     setup:/setdown:   值 = **节点引用列表**(v1.4; 格式与流程级一致, 块列表 `- 引用键`; 引用本组 group.nodes 下的
+#                                叶子子节点——段节点是子序列的头尾, 可各自带 shard/执行档, 是"段也要分片"的正解) 或 **内联动作序列**(v1.3 兼容口径)
+#    节点级   setup:/setdown:   值 = **内联动作序列**(包住该节点**整段** main; 分片默认每 lane 各成一环;
+#                                可声 segmentsFollowShard: false 改"整节点各一次": setup 一次 -> 各 lane 主体 -> setdown 一次)
+#    action级 setup:/setdown:   值 = **内联动作序列**(只包住**这一个** action, 收尾不等主段跑完)
+#  四层共用同一套运行语义: finally 恒跑 / 崩溃补跑 / 成对重臂(见文末速查); 段值形状: 字符串=节点引用, map=内联动作(AU204230)
+# ============================================================================
+
+materialization: LAZY             # LAZY=执行到才物化(默认); EAGER=创建期预建整棵节点树(lane/action 仍驱动期建)
+errorPolicy: CONTINUE_ON_ERROR    # 只兜"没自己声明 errorPolicy"的节点(含匿名 PARALLEL/IF 与其 lane); 就近声明优先
+autoRollback: false               # true: 本次驱动终态 FAILED/STOPPED 时, 收尾自动逆序补偿 compensable(ctx)=true 的已成功动作
+settleOnStop: false               # true: 人工停止走两阶段——先落 __stopRequested 标识(状态不动), 下一次调度进收尾轮
+                                  # (主链不推进, 节点/流程级 setdown 按 finally 补跑, 完成后才落 stopped);
+                                  # 不开 = 硬停(停止即落 stopped, 等待态上未跑的 setdown 不再补)
+# repeatSegments: true            # 顶层开关: 每趟驱动**无条件**重跑下面的流程级 setup/setdown 段节点;
+                                  # 不开 = 默认"成对重臂"(setdown 跑过 + setup/flow 段有非终态行 → 两段成对重跑)
+
+# ---- vars: 流程级变量空间。${vars.*} 物化期替换成字面量; handler 运行期 ctx.putVar 可续写
+vars:
+  dialect: mysql                  # 留空/由前置步骤检测后 putVar, 则下面的间接键自动拖到激活期再解
+  batchSize: 5000
+  tolerance: 0.05
+  dialects:                       # 方言片段(键名完全属于业务, 引擎无特权名) —— 靠**间接键**选支
+    mysql:
+      lockSql:   "ALTER TABLE ${table} DISABLE KEYS"
+      unlockSql: "ALTER TABLE ${table} ENABLE KEYS"
+    goldendb:
+      lockSql:   "SET TABLE ${table} READONLY"
+      unlockSql: "SET TABLE ${table} READWRITE"
+
+# ---- 四类监听器(链按声明顺序执行; 全局链与各层自己声明的合并, 全局在前)
+listeners:                        # 流程级 ProcessListener: before 抛异常=否决整条流程, after 纯通知
+  - name: auditTrail
+    config:
+      channel: kafka
+rollbackListeners:                # 回退自己的切点(补偿路径不走 flow, 上面那些监听器一个都不触发)
+  - name: dbConnFetcher           # before 现取连接信息并 ctx.putResult("dbConn", ...); 抛异常=否决整轮回退
+globalNodeListeners:              # 全局节点级 NodeListener: 每个节点都过一遍
+  - name: nodeAudit
+globalActionListeners:            # 全局 action 级 ActionListener: 每个 action(含分片每 lane 每项)都过
+  - name: checkItemRecorder
+
+# ---- flow DSL: 逗号=串行根 | PARALLEL(a,b) 匿名并行 | PARALLEL:标签(a,b) 命名并行(可自带策略/when/config)
+#      IF(条件,then,else) 分支 | 聚合节点写在 nodes.<name>.group 下, flow 里只写它的名字
+flow: "preflight, PARALLEL(migrateData, buildIndex), PARALLEL:checks(spaceCheck, rowCountCheck), IF(${vars.dialect} == 'goldendb', gdbVerify, mysqlVerify), summary"
+
+# ---- 流程级 setup/setdown: setup 先于 flow 按序跑; setdown = finally(主流程成败都跑; 让渡退出时不跑)
+setup:
+  - acquireLock
+setdown:
+  - releaseLock
+
+nodes:
+  # ============= ① 单 handler 叶子(最简节点: 合成一条 main 动作, id 回落节点 id) + 节点级监听器 =============
+  acquireLock:
+    name: 获取全局锁
+    handler: lockAcquire
+    config:
+      key: "migrate:${config.cluster}"      # ${config.*} 沿父链上溯; 创建参数(cluster 等)在任意层直接可读
+    listeners:
+      - name: lockMetrics
+
+  # ============= ② 多 action 序列 + 项级 guard(when) + 项级 listeners + 显式交接 =============
+  preflight:
+    name: 前置检查
+    errorPolicy: FAIL_FAST                  # 就近覆盖全局: 本节点内某项坏就停
+    actions:
+      - id: checkUser
+        handler: userChecker
+        name: 用户检查                      # 展示名(可选); id 才是引用键, 改名不动 flow
+        # action 间相互隔离(引擎不自动冒泡), 结论要往下传由 handler 显式放置:
+        #   ctx.putVar(...)                 -> ${vars.<k>}
+        #   ctx.upward().putResult(k, v)    -> 挂所属节点/lane 桶 -> ${result.<k>}
+      - id: createUser
+        handler: userChecker
+        when: "${vars.userExists} == false" # guard 操作数必须带 ${}: 裸路径会被当字符串比较
+        config:
+          action: create
+      - id: grantPrivilege
+        handler: userChecker
+        when: "${vars.userHasPrivilege} == false"
+        listeners:
+          - name: privilegeAudit
+        config:
+          action: grant
+
+  # ============= ③ 分片节点 + **节点级 setup/setdown 段**(每 lane 一个完整回路) + lane 并行 =============
+  migrateData:
+    name: 数据迁移
+    shard: dbTopology                       # resolveShardKeys 只解一次, 这批 lane 各跑一遍 setup→main→setdown
+    laneExecution: PARALLEL                 # lane 之间并行(默认 SERIAL); 收敛仍吃本节点 errorPolicy
+    # segmentsFollowShard: false            # 节点段改"整节点各一次": setup 一次 -> 各 lane 主体 -> setdown 一次
+                                            # (段行 lane 恒 null; 共享段属于整节点, 读不到 shardKey;
+                                            #  空分片首驱段不执行、重入遇空分片仍收尾到位; 可与 repeatSegments 叠加)
+    errorPolicy: CONTINUE_ON_ERROR
+    setup:                                  # 节点级前置段: 主段之前逐项跑; 段坏→主段整体跳过, 收尾**照跑**
+      - id: pauseReplication
+        handler: slavePause
+        # 分片键请在 handler 内取: ctx.shardKey() —— ${lane.shardKey} 不是桶路径, 解不出会落 __unresolved
+    actions:                                # 主段: 现状语义逐字不变
+      - id: disableKeys
+        handler: sqlCheck
+        config:
+          sql: "${vars.dialects.${vars.dialect}.lockSql}"   # 间接键选方言片段
+      - id: migrate
+        handler: dbMigrate
+        config:
+          batchSize: "${vars.batchSize}"
+      - id: enableKeys
+        handler: sqlCheck
+        config:
+          sql: "${vars.dialects.${vars.dialect}.unlockSql}"
+    setdown:                                # 节点级收尾段: finally 恒执行、段内不收敛、不查取消闸门、恒串行
+      - id: resumeReplication
+        handler: slaveResume
+
+  # ============= ④ actionExecution: PARALLEL(节点内动作并发) =============
+  #     注意: 主段并发的节点**不能**再挂 action 级段(窗口有先后语义, 装载期拒 AU204224)
+  buildIndex:
+    name: 索引重建
+    shard: dbTopology
+    laneExecution: SERIAL
+    actionExecution: PARALLEL               # 先补齐全部 action 行再扇出; FAIL_FAST 只取消尚未开始的兄弟
+    errorPolicy: FAIL_FAST
+    actions:
+      - id: rebuildFullText
+        handler: sqlCheck
+      - id: rebuildStatistic
+        handler: sqlCheck
+
+  # ============= ⑤ 命名并行容器: 给"某一条并行"就近挂策略/when/config(匿名并行只能吃全局) =============
+  checks:
+    name: 校验清单
+    errorPolicy: CONTINUE_ON_ERROR          # 纯容器: 再声明 handler/actions/setup/setdown/shard/laneExecution 报 AU204204
+
+  # ============= ⑥ 聚合节点 group: 一个业务项 = 一个对外名字, 内部步骤是子节点(键自动提升为 "组.子") =============
+  spaceCheck:
+    name: 空间占用校验
+    errorPolicy: FAIL_FAST                  # 组自己的收敛策略(取不到源端就别对比); 其他校验项照跑吃全局
+    # when: "${vars.skipSpace} == true"     # 组级 guard: 假则整组 SKIPPED, 子节点一个也不物化
+    config:
+      itemTable: t_validate_space           # 组级共享 config: 子节点 ${config.itemTable} 沿父链上溯可读
+                                            # ★别写 cluster: "${config.cluster}" —— 键名与占位符路径同名会解出自己
+    group:                                  # 与 flow 级同形: setup -> flow -> setdown 三段; 段包住**整个子节点序列**
+      setup:                                # 组级前置段; 也可与 group: 同级声明(两处等价, 同一字段两处都写拒 AU204235)
+        - id: lockItemTable
+          handler: spaceLock
+      # v1.4 备选: 段值写成**节点引用**(与流程级 setup/setdown 同一个格式, 块列表) —— 引用本组 nodes
+      #   下的叶子子节点, 段节点可各自带 shard/执行档, "段也要分片"就这么写:
+      #   setup:
+      #     - lockItemTable
+      #   setdown:
+      #     - unlockItemTable
+      #   (组内声明: lockItemTable 带 shard: targetTopology; 引用必须命中本组声明 AU204232、不得与主体重复 AU204233)
+      flow: "fetchSource,diffPerShard"      # 组内**串行**; 并行只在 lane 之间与 flow 的 PARALLEL
+      nodes:
+        fetchSource:
+          name: 取源端空间
+          handler: spaceProbeSource         # handler 内 ctx.node().parent().putResult("fetchSource", map) 显式挂组桶
+        diffPerShard:
+          name: 全分片空间对比
+          shard: targetTopology             # 分片轴只放"要产出结论的一侧"; 返回空列表请抛异常(否则节点静默 SUCCESS)
+          laneExecution: PARALLEL
+          actions:
+            - id: diffSpace
+              handler: spaceDiff
+              config:
+                srcBytes: "${result.fetchSource.bytes}"     # 沿父链上溯读组桶(激活期解析)
+                tolerance: "${vars.tolerance}"
+              listeners:
+                - name: checkItemRecorder   # action 级监听器: 每片跑完各触发一次, after 拿本片 status 与 shardKey
+      setdown:                              # 组级收尾段: 子节点序列无论成败都跑(finally; 段内不收敛, 不查取消闸门)
+        - id: unlockItemTable
+          handler: spaceUnlock
+
+  # ============= ⑦ **action 级段**(v1.2): 只包住一个 action, 收尾不必等主段跑完 =============
+  rowCountCheck:
+    name: 行数校验
+    group:
+      flow: "fetchRows,countPerShard"
+      nodes:
+        fetchRows:
+          name: 取源端行数
+          handler: rowCountSource
+        countPerShard:
+          name: 全分片行数对比
+          shard: targetTopology
+          laneExecution: PARALLEL
+          actions:
+            - id: countRows
+              handler: rowCountDiff
+              config:
+                srcRows: "${result.fetchRows.rows}"
+              setup:                        # 级 setup 段: **本 action 之前**跑(如抬配额/调超时)
+                - id: elevateQuota
+                  handler: quotaElevate
+              setdown:                      # 级 setdown 段: **本 action 之后立即**跑(finally: 本 action 成败都跑)
+                - id: restoreQuota
+                  handler: quotaRestore
+            - id: sampleCheck               # 同节点第二组级段: 成员按"定义侧成员表"各自收窄, 多组互不串扰
+              handler: sqlCheck
+              setup:
+                - id: elevateSample
+                  handler: sampleElevate
+              setdown:
+                - id: restoreSample
+                  handler: sampleRestore
+    # 级段四条硬规矩: ① setup/setdown 必须**同挂一个 action**(单边报 AU204220/221; 要跨多步请用节点段);
+    #                 ② 段动作自己不能再挂段(深度锁 1, AU204222);
+    #                 ③ 段动作 id 在该节点内与主段/节点段/其他级段合并唯一(AU204223);
+    #                 ④ 该节点不能是 actionExecution: PARALLEL(AU204224)
+
+  # ============= ⑧ IF 分支的两支(条件里可用 ${vars}/${config}/${result}; 解不出的引擎占位符判假) =============
+  gdbVerify:
+    name: GoldenDB 校验
+    handler: gdbVerifyAction
+  mysqlVerify:
+    name: MySQL 校验
+    handler: mysqlVerifyAction
+
+  # ============= ⑨ 节点级段 + repeatSegments: 本节点每趟驱动都重跑两段(动作需幂等) =============
+  summary:
+    name: 汇总报告
+    repeatSegments: true                    # 必须至少声明一段, 否则死配置 AU204217; 二次施加/重复收尾自担
+    setup:
+      - id: openReportSession
+        handler: reportOpen
+    actions:
+      - id: writeReport
+        handler: sqlCheck
+        config:
+          sql: "INSERT INTO migrate_report(proc_inst_id) VALUES('${vars.procInstId}')"
+    setdown:
+      - id: closeReportSession
+        handler: reportClose
+
+  # ============= ⑩ 流程级收尾(整条流程的 finally) =============
+  releaseLock:
+    name: 释放全局锁
+    handler: lockRelease
+
+# ============================================================================
+#  占位符速查
+#   可解析: ${vars.k}  ${params.k}(物化期)  ${config.k}  ${result.k}   —— 后三者沿上下文父链上溯, 内层胜
+#           ${process|node|lane|action.<bucket>.k}                    —— 锁定某一层的桶
+#           ${vars.dicts.${vars.kind}.sql}                            —— 间接键选片段(选中支后再填一轮)
+#   不可解析: 非桶路径(如 ${lane.shardKey}) → 原样保留并落 result.__unresolved; 分片键请用 ctx.shardKey()
+#   handler 写值: ctx.putVar(k,v) / ctx.putResult(k,v)(本 action 行) / ctx.upward().putResult(k,v)(所属节点或 lane 桶)
+#
+#  运行语义速查
+#   finally        收尾段无论主体成败都跑; 主体失败/前置段坏 → 收尾**立即**跑(不必等主段全跑完)
+#   让渡           handler 返 pending/paused/suspended = 本轮退出: 后续段(含收尾)**不跑**, 重入从非终态行续跑
+#   崩溃补跑       主体已成、收尾未跑 → 重驱动只补收尾(节点级靠不变式 I1 推迟容器落终态; 级段靠定义驱动入口)
+#   成对重臂       现场被收尾撤掉过(收尾有 success) + 本轮又要重跑(前置/主体有非终态行) → 前置与收尾**成对重跑**
+#                  (四层同判据; 组级的主体待跑 = 子节点序列有非终态行, 或 LAZY 下尚有子节点未物化)
+#                  (共享段模式同判据, 主体待跑换成跨 lane 取证: 任一 lane 未物化/有非终态 main 行)
+#   组级段两种形状 内联动作(段行挂组, lane/shard 恒 null) / 节点引用(段=组内子节点, 自带分片与自身三段回路);
+#                  段/开关写在 group: 段内(推荐, 与流程级 setup/flow/setdown 三段同形)或与 group: 同级, 两处等价;
+#                  节点引用形态的段节点动作行 segment=main -> **参与回退与进度分母**(与内联段行被排除不同)
+#   段不跟随分片   segmentsFollowShard: false(仅分片叶子的节点级段): setup/setdown 整节点各一次(段行 lane 恒 null,
+#                  主体仍逐 lane 一行, lane 行只反映各自主体); action 级段不受影响(仍随主体每 lane 各跑一遍)
+#   repeatSegments 显式强语义: 每趟驱动无条件重跑(流程级/组级/节点级同名开关; action 级不提供), 段动作必须幂等
+#   回退/重放      段行(segment≠main)一律不参与补偿与重放; 需要被撤销的动作请放主段
+#   进度口径       total/done/percent 只算 main; items 明细带 segment(setup|main|setdown|action-setup|action-setdown)
+# ============================================================================

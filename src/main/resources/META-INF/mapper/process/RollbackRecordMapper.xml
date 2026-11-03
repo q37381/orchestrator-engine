@@ -6,9 +6,9 @@
   注: 本表 status 是补偿/重放状态机(RollbackStatus 枚举), 不属于实例运行态 Status 枚举;
     入参是小写规范值字符串(调用方传 RollbackStatus.getStatus(), SQL 普通 #{to} 绑定)。
 -->
-<mapper namespace="com.tesla.ities.process.mapper.RollbackRecordMapper">
+<mapper namespace="com.tt.ii.process.mapper.RollbackRecordMapper">
 
-    <resultMap id="BaseResultMap" type="com.tesla.ities.process.domain.RollbackRecordEntity">
+    <resultMap id="BaseResultMap" type="com.tt.ii.process.domain.RollbackRecordEntity">
         <id     property="autoId"        column="auto_id"/>
         <id     property="rollbackId"    column="rollback_id"/>
         <result property="procInstId"    column="proc_inst_id"/>
@@ -28,7 +28,7 @@
         status, operator, detail, creator_id, updator_id, created_at, updated_at
     </sql>
 
-    <insert id="insert" parameterType="com.tesla.ities.process.domain.RollbackRecordEntity"
+    <insert id="insert" parameterType="com.tt.ii.process.domain.RollbackRecordEntity"
             useGeneratedKeys="true" keyProperty="autoId" keyColumn="auto_id">
         INSERT INTO ${orch.table.rollbackRecord}(rollback_id, proc_inst_id, action_inst_id, action_def_id, status, operator, detail, creator_id, updator_id)
         VALUES(#{rollbackId}, #{procInstId}, #{actionInstId}, #{actionDefId}, #{status}, #{operator}, #{detail}, #{creatorId}, #{updatorId})

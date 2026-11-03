@@ -1,0 +1,461 @@
+package com.tt.ii.process.integration;
+
+import com.tt.ii.process.api.ProcessExecution;
+import com.tt.ii.process.core.engine.RollbackService;
+import com.tt.ii.process.core.model.RollbackStatus;
+import com.tt.ii.process.core.model.Status;
+import com.tt.ii.process.domain.ActionInstEntity;
+import com.tt.ii.process.domain.NodeInstEntity;
+import com.tt.ii.process.domain.ProcessInstEntity;
+import com.tt.ii.process.domain.RollbackRecordEntity;
+import com.tt.ii.process.util.Json;
+import org.junit.Assert;
+import org.junit.Test;
+
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+
+/**
+ * 引擎错误/否决/回退/观察路径端到端(装配见 {@link EngineE2ETestBase}):
+ *  - 三类监听器 before 否决(process/node/action) -> 各自 FAILED 落行 + after 抛异常被 ListenerEngine 吞掉;
+ *  - 全局监听器链(globalNode/ActionListeners)在真实驱动里合并生效;
+ *  - Saga 回退: 补偿成功 / 走 ActionHandler 默认补偿 / 遇不可补偿(BLOCKED) / 补偿自身失败(COMPENSATE_FAILED) /
+ *    前置否决(veto) / 空回退 / 目标不存在; 分片动作回退重建 lane 上下文 + payload。
+ */
+public class EngineErrorRollbackTest extends EngineE2ETestBase {
+
+    // ===================== 监听器否决 =====================
+
+    @Test
+    public void processBeforeVetoFailsWithoutDrivingRoots() {
+        publish("vproc", ""
+                + "flow: \"x\"\n"
+                + "listeners:\n  - name: pVeto\n"
+                + "nodes:\n  x:\n    handler: ok\n");
+        ProcessExecution r = run("vproc");
+        Assert.assertEquals(Status.FAILED, r.getStatus());
+        Assert.assertTrue(nodeMapper.findRoots(r.getProcInstId()).isEmpty());   // 根从未驱动
+    }
+
+    @Test
+    public void nodeBeforeVetoFailsNode() {
+        publish("vnode", ""
+                + "flow: \"x\"\n"
+                + "nodes:\n"
+                + "  x:\n"
+                + "    handler: ok\n"
+                + "    listeners:\n      - name: nVeto\n");
+        ProcessExecution r = run("vnode");
+        Assert.assertEquals(Status.FAILED, r.getStatus());
+        NodeInstEntity node = nodeMapper.findRoots(r.getProcInstId()).get(0);
+        Assert.assertEquals(Status.FAILED.getStatus(), node.getStatus());
+        Assert.assertTrue(node.getResult().contains("__error"));
+        // action 从未执行(before 否决)
+        Assert.assertTrue(actionMapper.findInContainer(node.getNodeInstId(), null).isEmpty());
+    }
+
+    @Test
+    public void actionBeforeVetoFailsAction() {
+        publish("vaction", ""
+                + "flow: \"x\"\n"
+                + "nodes:\n"
+                + "  x:\n"
+                + "    actions:\n"
+                + "      - {id: a, handler: ok, listeners: [{name: aVeto}]}\n");
+        ProcessExecution r = run("vaction");
+        Assert.assertEquals(Status.FAILED, r.getStatus());
+        NodeInstEntity node = nodeMapper.findRoots(r.getProcInstId()).get(0);
+        ActionInstEntity a = actionMapper.findInContainer(node.getNodeInstId(), null).get(0);
+        Assert.assertEquals(Status.FAILED.getStatus(), a.getStatus());
+        Assert.assertTrue(Json.readMap(a.getResult()).containsKey("__error"));
+    }
+
+    // ===================== after 抛异常被吞(纯通知) =====================
+
+    @Test
+    public void afterListenerExceptionsAreSwallowed() {
+        publish("afterboom", ""
+                + "flow: \"x\"\n"
+                + "listeners:\n  - name: pAfterBoom\n"
+                + "nodes:\n"
+                + "  x:\n"
+                + "    handler: ok\n"
+                + "    listeners:\n      - name: nAfterBoom\n"
+                + "    actions:\n      - {id: a, handler: ok, listeners: [{name: aAfterBoom}]}\n");
+        ProcessExecution r = run("afterboom");
+        // after 里的异常只是 warn 吞掉, 不改终态
+        Assert.assertEquals(Status.SUCCESS, r.getStatus());
+    }
+
+    // ===================== 全局链合并生效 =====================
+
+    @Test
+    public void globalNodeAndActionListenersFire() {
+        publish("globals", ""
+                + "flow: \"x\"\n"
+                + "globalNodeListeners:\n  - name: nRecord\n"
+                + "globalActionListeners:\n  - name: aRecord\n"
+                + "nodes:\n  x:\n    handler: ok\n");
+        ProcessExecution r = run("globals");
+        Assert.assertEquals(Status.SUCCESS, r.getStatus());
+        Assert.assertTrue(rec.nodeBefore.get() >= 1);
+        Assert.assertTrue(rec.actionBefore.get() >= 1);
+        Assert.assertTrue(rec.actionAfter.get() >= 1);
+    }
+
+    // ===================== 回退: 补偿 / 默认补偿 / 阻断 / 失败 =====================
+
+    @Test
+    public void rollbackCompensatesSuccessfulActions() {
+        publish("rbOk", ""
+                + "flow: \"a\"\n"
+                + "rollbackListeners:\n  - name: rbRecord\n"
+                + "nodes:\n  a:\n    handler: compOk\n");
+        ProcessExecution r = run("rbOk");
+        Assert.assertEquals(Status.SUCCESS, r.getStatus());
+        RollbackService.RollbackReport rep = facade.doRollback(r.getProcInstId(), "u1");
+        Assert.assertEquals(1, rep.compensated.size());
+        Assert.assertEquals(Status.SUCCESS, rep.outcome());
+        Assert.assertTrue(rec.order.contains("rollbackBefore"));
+        Assert.assertTrue(rec.order.contains("rollbackAfter:success"));
+        // 流程级 result 只在驱动路径脏刷: 回退前置挂的现场信息(dbConn)不入库
+        Assert.assertNull("回退路径不刷流程级 result", processMapper.findById(r.getProcInstId()).getResult());
+    }
+
+    @Test
+    public void rollbackUsesDefaultCompensateWhenHandlerDoesNotOverride() {
+        publish("rbDefault", ""
+                + "flow: \"a\"\n"
+                + "nodes:\n  a:\n    handler: compDefault\n");
+        ProcessExecution r = run("rbDefault");
+        RollbackService.RollbackReport rep = facade.doRollback(r.getProcInstId(), "u1");
+        Assert.assertEquals(1, rep.compensated.size());   // ActionHandler.default compensate() 空实现被调用
+    }
+
+    @Test
+    public void rollbackStopsAtNonCompensableAction() {
+        publish("rbBlock", ""
+                + "flow: \"a\"\n"
+                + "nodes:\n  a:\n    handler: nonComp\n");
+        ProcessExecution r = run("rbBlock");
+        RollbackService.RollbackReport rep = facade.doRollback(r.getProcInstId(), "u1");
+        Assert.assertEquals(1, rep.blocked.size());
+        Assert.assertEquals(Status.STOPPED, rep.outcome());
+    }
+
+    /**
+     * 可补偿性按 action 自己的 config 现判(compensable(ctx)): 同一个 handler 的两条 action 结论可以不同。
+     * 逆序先补后执行的 b(rollback=true); 轮到 a 时按其 config 判成不可补偿 -> BLOCKED 停下。
+     */
+    @Test
+    public void rollbackDecidesCompensableByActionConfig() {
+        publish("rbDyn", ""
+                + "flow: \"a,b\"\n"
+                + "nodes:\n"
+                + "  a:\n    handler: compByConfig\n    config:\n      rollback: false\n"
+                + "  b:\n    handler: compByConfig\n    config:\n      rollback: true\n");
+        ProcessExecution r = run("rbDyn");
+        Assert.assertEquals(Status.SUCCESS, r.getStatus());
+
+        RollbackService.RollbackReport rep = facade.doRollback(r.getProcInstId(), "u1");
+        Assert.assertEquals(1, rep.compensated.size());
+        Assert.assertEquals("b", rep.compensated.get(0));
+        Assert.assertEquals(1, rep.blocked.size());
+        Assert.assertTrue(rep.blocked.get(0).contains("a"));
+        Assert.assertEquals(Status.STOPPED, rep.outcome());
+        Assert.assertTrue(rec.order.contains("compensate:compByConfig:b"));
+        Assert.assertFalse("rollback=false 的 a 不得进补偿", rec.order.contains("compensate:compByConfig:a"));
+
+        // BLOCKED 也走 COMPENSATING 占位再改状态(每步一行), 与补偿失败同一手法
+        for (RollbackRecordEntity row : rollbackMapper.findByProcess(r.getProcInstId())) {
+            if ("a".equals(row.getActionDefId())) {
+                Assert.assertEquals(RollbackStatus.BLOCKED.getStatus(), row.getStatus());
+            }
+        }
+    }
+
+    @Test
+    public void rollbackRecordsCompensateFailure() {
+        publish("rbFail", ""
+                + "flow: \"a\"\n"
+                + "nodes:\n  a:\n    handler: compFail\n");
+        ProcessExecution r = run("rbFail");
+        RollbackService.RollbackReport rep = facade.doRollback(r.getProcInstId(), "u1");
+        Assert.assertEquals(1, rep.failed.size());
+        Assert.assertEquals(Status.FAILED, rep.outcome());
+    }
+
+    @Test
+    public void rollbackVetoedByBeforeListener() {
+        publish("rbVeto", ""
+                + "flow: \"a\"\n"
+                + "rollbackListeners:\n  - name: rbVeto\n"
+                + "nodes:\n  a:\n    handler: compOk\n");
+        ProcessExecution r = run("rbVeto");
+        RollbackService.RollbackReport rep = facade.doRollback(r.getProcInstId(), "u1");
+        Assert.assertNotNull("前置否决记入 veto", rep.veto);
+        Assert.assertEquals(0, rep.compensated.size());
+        Assert.assertEquals(Status.FAILED, rep.outcome());
+    }
+
+    @Test
+    public void rollbackOnShardedActionsRebuildsLaneContext() {
+        // dbMigrate 可补偿; 分片 3 lane -> 回退逐条补(覆盖 lane 上下文重建 + payload)
+        publish("rbShard", ""
+                + "flow: \"s\"\n"
+                + "nodes:\n"
+                + "  s:\n"
+                + "    handler: dbMigrate\n"
+                + "    shard: dbTopology\n"
+                + "    laneExecution: SERIAL\n");
+        ProcessExecution r = run("rbShard");
+        Assert.assertEquals(Status.SUCCESS, r.getStatus());
+        RollbackService.RollbackReport rep = facade.doRollback(r.getProcInstId(), "u1");
+        Assert.assertEquals(3, rep.compensated.size());   // 一主两从 3 个成功分片动作
+    }
+
+    @Test
+    public void rollbackWithNothingSucceededIsNoop() {
+        publish("rbEmpty", ""
+                + "flow: \"a\"\n"
+                + "nodes:\n  a:\n    handler: skipper\n");   // skipped 不算成功 -> 无补偿对象
+        ProcessExecution r = run("rbEmpty");
+        RollbackService.RollbackReport rep = facade.doRollback(r.getProcInstId(), "u1");
+        Assert.assertTrue(rep.compensated.isEmpty());
+        Assert.assertTrue(rep.blocked.isEmpty());
+    }
+
+    @Test
+    public void rollbackOnMissingProcessIsNoop() {
+        RollbackService.RollbackReport rep = facade.doRollback("ghost", "u1");
+        Assert.assertTrue(rep.compensated.isEmpty());
+        Assert.assertEquals(Status.SUCCESS, rep.outcome());
+    }
+
+    @Test
+    public void rollbackWarnsOnUnresolvedConfigPlaceholder() {
+        // action config 里的 ${result.ghost.x} 激活期仍解不出 -> 补偿前 findUnresolved 非空 -> 告警(不阻断补偿)
+        publish("rbUnresolved", ""
+                + "flow: \"a\"\n"
+                + "nodes:\n  a:\n    handler: compOk\n    config:\n      leftover: \"${result.ghost.value}\"\n");
+        ProcessExecution r = run("rbUnresolved");
+        RollbackService.RollbackReport rep = facade.doRollback(r.getProcInstId(), "u1");
+        Assert.assertEquals(1, rep.compensated.size());
+    }
+
+    @Test
+    public void rollbackOverParallelChildrenCollectsSubtree() {
+        // EAGER PARALLEL 两个可补偿叶子 -> 回退递归收集子树(collect 的 findChildren 分支)
+        publish("rbChildren", ""
+                + "materialization: EAGER\n"
+                + "flow: \"PARALLEL(a,b)\"\n"
+                + "nodes:\n  a:\n    handler: compOk\n  b:\n    handler: compOk\n");
+        ProcessExecution r = run("rbChildren");
+        Assert.assertEquals(Status.SUCCESS, r.getStatus());
+        RollbackService.RollbackReport rep = facade.doRollback(r.getProcInstId(), "u1");
+        Assert.assertEquals(2, rep.compensated.size());
+    }
+
+    @Test
+    public void rollbackBlockedOnDefaultNonCompensableHandler() {
+        // `ok` 不覆写 compensable(ctx) -> 走 ActionHandler 默认(返回 false) -> BLOCKED
+        publish("rbDefaultBlock", "flow: \"a\"\nnodes:\n  a:\n    handler: ok\n");
+        ProcessExecution r = run("rbDefaultBlock");
+        RollbackService.RollbackReport rep = facade.doRollback(r.getProcInstId(), "u1");
+        Assert.assertEquals(1, rep.blocked.size());
+        Assert.assertEquals(Status.STOPPED, rep.outcome());
+    }
+
+    @Test
+    public void rollbackWithAfterOnlyListenerUsesDefaultBefore() {
+        // rbAfterOnly 只覆写 after -> before 走 RollbackListener 默认空实现(不否决)
+        publish("rbAfterOnly", ""
+                + "flow: \"a\"\n"
+                + "rollbackListeners:\n  - name: rbAfterOnly\n"
+                + "nodes:\n  a:\n    handler: compOk\n");
+        ProcessExecution r = run("rbAfterOnly");
+        RollbackService.RollbackReport rep = facade.doRollback(r.getProcInstId(), "u1");
+        Assert.assertEquals(1, rep.compensated.size());
+        Assert.assertTrue(rec.order.contains("rbAfterOnly"));
+    }
+
+    @Test
+    public void rollbackAfterListenerExceptionIsSwallowed() {
+        // rbAfterBoom.after 抛异常 -> ListenerEngine 吞掉, 不影响补偿结果
+        publish("rbAfterBoom", ""
+                + "flow: \"a\"\n"
+                + "rollbackListeners:\n  - name: rbAfterBoom\n"
+                + "nodes:\n  a:\n    handler: compOk\n");
+        ProcessExecution r = run("rbAfterBoom");
+        RollbackService.RollbackReport rep = facade.doRollback(r.getProcInstId(), "u1");
+        Assert.assertEquals(1, rep.compensated.size());
+        Assert.assertEquals(Status.SUCCESS, rep.outcome());
+    }
+
+    // ===================== 失败信息并入原有 result, 不丢业务数据 =====================
+
+    @Test
+    public void failureInfoMergesExistingResult() {
+        publish("merge", ""
+                + "flow: \"x\"\n"
+                + "nodes:\n"
+                + "  x:\n"
+                + "    actions:\n"
+                + "      - {id: a, handler: flagTrue, listeners: [{name: aVeto}]}\n");   // veto 在 before, handler 未跑
+        ProcessExecution r = run("merge");
+        NodeInstEntity node = nodeMapper.findRoots(r.getProcInstId()).get(0);
+        ActionInstEntity a = actionMapper.findInContainer(node.getNodeInstId(), null).get(0);
+        Assert.assertEquals(Status.FAILED.getStatus(), a.getStatus());
+        Assert.assertTrue(Json.readMap(a.getResult()).containsKey("__error"));
+    }
+
+    // ===================== 流程被人工 STOP 抢先翻走: finalize 以库中真值为准 =====================
+
+    @Test
+    public void finalizeReflectsPreemptedByManualStop() {
+        // 建一条 PENDING 流程, 手动置 RUNNING 并 STOP, 再 start: start 见非 PENDING -> 返回当前 stopped, 不驱动
+        publish("preempt", "flow: \"x\"\nnodes:\n  x:\n    handler: ok\n");
+        String pid = facade.create("preempt", 1, null, "u1");
+        processMapper.claim(pid, "u1");   // pending -> running
+        processMapper.casStatus(pid, Status.RUNNING.getStatus(), Status.STOPPED.getStatus(), "u1");
+        ProcessExecution r = facade.start(pid);
+        Assert.assertEquals(Status.STOPPED, r.getStatus());
+    }
+
+    @Test
+    public void progressOnUnknownProcessHasZeroTotal() {
+        Map<String, Object> p = facade.progress("no-such");
+        Assert.assertEquals("no-such", p.get("procInstId"));
+        Assert.assertEquals(0, p.get("total"));
+        Assert.assertEquals(100, p.get("percent"));   // total==0 -> 100
+    }
+
+    @Test
+    public void configPlaceholderFromCreateParamsResolvesViaContext() {
+        // ${config.cluster} 沿父链上溯到流程级 config(= 创建输入)
+        publish("cfgparam", ""
+                + "flow: \"x\"\n"
+                + "nodes:\n  x:\n    handler: flagTrue\n    config:\n      cluster: \"${config.cluster}\"\n");
+        ProcessExecution r = facade.createAndStart("cfgparam", 1,
+                Collections.singletonMap("cluster", "prod-a"), "u1");
+        Assert.assertEquals(Status.SUCCESS, r.getStatus());
+        ProcessInstEntity p = processMapper.findById(r.getProcInstId());
+        Assert.assertEquals("prod-a", Json.readMap(p.getConfig()).get("cluster"));
+    }
+
+    // ===================== 自动回退(定义顶层 autoRollback) =====================
+
+    /** 配了 autoRollback 的流程失败: 收尾当场逆序补偿已成功的 action, 补偿记录的操作人标成 auto(与人工分开)。 */
+    @Test
+    public void autoRollbackFiresOnFailed() {
+        publish("arFail", ""
+                + "autoRollback: true\n"
+                + "flow: \"a,b\"\n"
+                + "nodes:\n  a:\n    handler: compOk\n  b:\n    handler: thrower\n");
+        ProcessExecution r = run("arFail");
+        Assert.assertEquals(Status.FAILED, r.getStatus());
+        Assert.assertTrue("已成功的 a 被自动撤销", rec.order.contains("compensate:compOk"));
+        RollbackRecordEntity row = rollbackMapper.findByProcess(r.getProcInstId()).get(0);
+        Assert.assertEquals(RollbackStatus.COMPENSATED.getStatus(), row.getStatus());
+        Assert.assertEquals("auto", row.getOperator());
+        Assert.assertEquals("流程终态不因回退改写", Status.FAILED.getStatus(),
+                processMapper.findById(r.getProcInstId()).getStatus());
+    }
+
+    /** 没配 autoRollback 时行为照旧: 失败只落终态, 一行都不补(默认仍只走人工回退)。 */
+    @Test
+    public void failedWithoutAutoRollbackCompensatesNothing() {
+        publish("arOff", ""
+                + "flow: \"a,b\"\n"
+                + "nodes:\n  a:\n    handler: compOk\n  b:\n    handler: thrower\n");
+        ProcessExecution r = run("arOff");
+        Assert.assertEquals(Status.FAILED, r.getStatus());
+        Assert.assertFalse("不该自动补偿", rec.order.contains("compensate:compOk"));
+        Assert.assertTrue(rollbackMapper.findByProcess(r.getProcInstId()).isEmpty());
+    }
+
+    /** 人工 stop 抢先把闸门翻成 STOPPED: 收尾读到的是库上真值, 同样触发自动回退。 */
+    @Test
+    public void autoRollbackFiresOnStopped() {
+        publish("arStop", ""
+                + "autoRollback: true\n"
+                + "flow: \"a,b,c\"\n"
+                + "nodes:\n  a:\n    handler: compOk\n  b:\n    handler: stopper\n  c:\n    handler: compOk\n");
+        String pid = facade.create("arStop", 1, null, "u1");
+        processMapper.claim(pid, "u1");                       // pending -> running(引擎已认领)
+        Assert.assertEquals(Status.STOPPED, engine.driveClaimed(pid));   // b 把闸门翻 stopped, c 被 drain 成 STOPPED
+        Assert.assertEquals("逆序撤销已成功的两步", Arrays.asList("b", "a"), compensatedActionDefs(pid));
+    }
+
+    /** 人工 pause 停在 PAUSED: 暂停是可恢复的, 不该顺手把副作用拆掉。 */
+    @Test
+    public void autoRollbackDoesNotFireOnPaused() {
+        publish("arPause", ""
+                + "autoRollback: true\n"
+                + "flow: \"a,b,c\"\n"
+                + "nodes:\n  a:\n    handler: compOk\n  b:\n    handler: thrower\n  c:\n    handler: compOk\n");
+        String pid = facade.create("arPause", 1, null, "u1");
+        processMapper.claim(pid, "u1");
+        Assert.assertTrue(facade.pause(pid, "op1"));          // running -> paused(闸门算取消但不算停止)
+        Assert.assertEquals(Status.PAUSED, engine.driveClaimed(pid));
+        Assert.assertTrue("暂停不触发自动回退", rollbackMapper.findByProcess(pid).isEmpty());
+    }
+
+    /** 成功终态一律不回退: autoRollback 只在坏终态生效, 正常跑完的流程不能被自己拆了。 */
+    @Test
+    public void autoRollbackKeepsSuccessfulProcessIntact() {
+        publish("arOk", ""
+                + "autoRollback: true\n"
+                + "flow: \"a\"\n"
+                + "nodes:\n  a:\n    handler: compOk\n");
+        ProcessExecution r = run("arOk");
+        Assert.assertEquals(Status.SUCCESS, r.getStatus());
+        Assert.assertTrue(rollbackMapper.findByProcess(r.getProcInstId()).isEmpty());
+    }
+
+    /**
+     * 配了 autoRollback 但没有任何成功 action(流程 before 就否决): 回退空转, 连回退前置切点都不拉
+     * (免得白取一次连接信息)。
+     */
+    @Test
+    public void autoRollbackWithNothingSucceededSkipsListeners() {
+        publish("arVeto", ""
+                + "autoRollback: true\n"
+                + "flow: \"a\"\n"
+                + "listeners:\n  - name: pVeto\n"
+                + "rollbackListeners:\n  - name: rbRecord\n"
+                + "nodes:\n  a:\n    handler: compOk\n");
+        ProcessExecution r = run("arVeto");
+        Assert.assertEquals(Status.FAILED, r.getStatus());
+        Assert.assertTrue(rollbackMapper.findByProcess(r.getProcInstId()).isEmpty());
+        Assert.assertFalse("无物可补时不白拉前置监听器", rec.order.contains("rollbackBefore"));
+    }
+
+    /** 自动回退补过的 action, 人工再回退一次不重复撤销(只看最新一条 rollback_record)。 */
+    @Test
+    public void manualRollbackAfterAutoDoesNotRecompensate() {
+        publish("arTwice", ""
+                + "autoRollback: true\n"
+                + "flow: \"a,b\"\n"
+                + "nodes:\n  a:\n    handler: compOk\n  b:\n    handler: thrower\n");
+        ProcessExecution r = run("arTwice");
+        Assert.assertEquals(Status.FAILED, r.getStatus());
+        RollbackService.RollbackReport rep = facade.doRollback(r.getProcInstId(), "u1");
+        Assert.assertTrue("已补偿的不重复撤销", rep.compensated.isEmpty());
+        Assert.assertEquals(1, rep.skipped.size());
+    }
+
+    /** 该流程**补偿成功**的那些 action 的定义 id, 按补偿执行顺序(rollback_record 的 auto_id 升序)。 */
+    private List<String> compensatedActionDefs(String procInstId) {
+        List<String> out = new ArrayList<>();
+        for (RollbackRecordEntity row : rollbackMapper.findByProcess(procInstId)) {
+            if (RollbackStatus.COMPENSATED.getStatus().equals(row.getStatus())) {
+                out.add(row.getActionDefId());
+            }
+        }
+        return out;
+    }
+}

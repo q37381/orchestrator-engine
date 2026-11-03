@@ -152,6 +152,7 @@ ProcessContext（流程：config=创建输入，vars，result）
 | `globalActionListeners` | 列表 | 全局 action 级监听器：对每个 action（含每 lane 每个）都生效 | 无 |
 | `errorPolicy` | 字符串 | **流程级全局**错误策略（`FAIL_FAST`/`CONTINUE_ON_ERROR`），节点未声明即回落它；同时决定顶层根序列的收敛 | `FAIL_FAST` |
 | `autoRollback` | 字符串 | 自动回退开关，**只认 `true`/`false`**（大小写不敏感） | 关 |
+| `settleOnStop` | 字符串 | 停止先收尾开关，**只认 `true`/`false`**：停止走两阶段（先落 `__stopRequested`，下一轮调度进收尾轮补跑 setdown 后才落 stopped）；不发错当场拒（`AU204234`） | 关（硬停） |
 | `nodes` | Map | 节点声明表；**Map 的键 = `flow` 里的引用 id** | 空 |
 
 节点段属性（`nodes.<id>`）：
@@ -196,6 +197,8 @@ group       ::= "GROUP" ":" NAME "(" items ")"            # 名字**必须**写
 NODE_REF    ::= 不含逗号、括号、冒号、空白的 token
 ```
 
+`flow` 段既可以是逗号分隔的字符串，也可以是 YAML 列表（每项 = 一个顶层表达式，装载期按顶层逗号拼接）；字符串里的换行/缩进/制表/空白在 token 之间一律忽略，多行块写法与单行等价（尾随逗号见 FR-DSL-08）。
+
 | 编号 | 需求 |
 | --- | --- |
 | FR-DSL-01 | `flow` 文本**必须**可被解析器重新解析，且解析结果**必须**能通过 `toFlow` 写回与原文一致的文本（往返互逆）。任何语法扩展若不能往返，禁止合入 |
@@ -205,7 +208,7 @@ NODE_REF    ::= 不含逗号、括号、冒号、空白的 token
 | FR-DSL-05 | `GROUP` **必须**带命名后缀，无名 `GROUP(a,b)` 一律拒绝（`AU204102`）。缘由：旧写法 `GROUP(名字,a,b)` 与匿名容器 `GROUP(a,b)` 文本同形而形状不同（1 个容器 vs 2 个子项），猜错会导致实例行与表达式树错位多出一行 |
 | FR-DSL-06 | 命名容器空子项**必须**拒绝：`PARALLEL:checks()`/`PARALLEL:checks( )` 报 `AU204108`；`GROUP:名()` 报 `AU204103`。匿名 `PARALLEL()` 允许（无子项即空扇出） |
 | FR-DSL-07 | 关键字后只有冒号没有名字（`PARALLEL:(a,b)`）**必须**拒绝（`AU204109`）；表达式无法识别的表达式类型写回时报 `AU204104`；缺节点引用报 `AU204105`；缺期望字符报 `AU204106`；解析结束仍有多余字符报 `AU204101` |
-| FR-DSL-08 | 容器子项列表允许尾随逗号（`PARALLEL(a,b,)`），**不得**因此多解析出一个空表达式 |
+| FR-DSL-08 | 尾随逗号（容器子项列表与整条 flow 的结尾，如 `PARALLEL(a,b,)` / `GROUP:g(a,b,)` / `IF(c,a,b,)` / `a,b,`）**必须**按收口处理，**不得**因此多解析出一个空表达式；真正的空项（`a,,b`）仍报 `AU204105` |
 | FR-DSL-09 | 实例定位**必须**不做路径反查：驱动按定义顺序前向走查，实例行按 `auto_id`（声明顺序）升序与表达式列表**按下标对齐**；已有终态行幂等跳过，缺行用手里的表达式补物化 |
 
 ### 5.3 表达式的运行期语义
@@ -270,7 +273,7 @@ nodes:
 | --- | --- |
 | FR-LOAD-01 | YAML **必须**用 `SafeConstructor` 解析，禁止任意对象实例化 |
 | FR-LOAD-02 | `materialization` 声明值非法**必须**拒绝（`AU204201`）；反查**必须**大小写不敏感且与 Locale 无关（不得使用依赖默认 Locale 的 `toUpperCase()`） |
-| FR-LOAD-03 | 顶层布尔开关（目前只有 `autoRollback`）**必须**"写了拼错当场拒"（`AU204214`），未写/空白视为没声明；落库文本**必须**归一化为小写 `true`/`false` |
+| FR-LOAD-03 | 顶层布尔开关（`autoRollback` / `settleOnStop`）**必须**"写了拼错当场拒"（`AU204214` / `AU204234`），未写/空白视为没声明；落库文本**必须**归一化为小写 `true`/`false` |
 | FR-LOAD-04 | 监听器链的生效值**必须**由"全局链 + 本地声明"合并：**全局在前、本地在后**，各按声明顺序，**不做同名去重**（同名视为有意的两次触发，各带各的 config）；两边都没声明返回 `null`（＝该切点 no-op） |
 | FR-LOAD-05 | 错误策略的生效值**必须**按分层单值覆盖：节点声明 > 流程级全局 > 默认 `FAIL_FAST`。与监听器链的"拼接"语义不同 |
 | FR-LOAD-06 | 串行序列（顶层根序列、GROUP 组内序列）的收敛**必须**"就近声明优先"：该子项自己写了 `errorPolicy` 就听它的（`FAIL_FAST`＝我坏了叫停剩余，`CONTINUE_ON_ERROR`＝我失败也别拦后面），没写才回落本层策略。匿名 PARALLEL/IF 无声明恒回落本层 |
@@ -410,7 +413,7 @@ nodes:
 | FR-SPI-02 | 注册**必须**在装配期查重并拒重复：同名 `ActionHandler`/四类 Listener 重复注册分别报 `AU204601/204603/204605/204607/204609`；未注册即调用报 `AU204602/204604/204606/204608/204610`，`ShardResolver` 未注册报 `AU204611` |
 | FR-SPI-03 | `ActionHandler.handle(ActionContext)` **必须**只返回 `Status`（收敛为无 `ActionResult`/无跳转指令）：要存结果就 `ctx.putResult/putVar`，要条件跳过就用声明式 `when`，**不得**在 handler 里做动态跳转；过程态返回值只允许 `pending`/`paused`/`suspended`（让渡，见 5.23） |
 | FR-SPI-04 | 执行契约是 **at-least-once**：`handle` **必须**幂等（重跑安全）。这条**必须**写进 SPI 注释与接入文档，因为重试/崩溃恢复都会重入 |
-| FR-SPI-05 | 补偿能力**必须**由 handler 自己声明：`compensable()` 默认 `false`，`compensate(ctx)` 默认空；不可补偿的步骤在回退时导致 `BLOCKED` |
+| FR-SPI-05 | 补偿能力**必须**由 handler 自己声明：`compensable(ctx)` 默认 `false`（入参为该 action 重建后的上下文，config 已做激活期解析，可按 action 自己的配置动态判定），`compensate(ctx)` 默认空；不可补偿的步骤在回退时导致 `BLOCKED` |
 | FR-SPI-06 | 注册表**必须**容忍"集合注入为空"的装配场景：宿主一个 SPI 都没注册时，引擎装配不得失败；但依赖这些 Bean 的装配点（配置类里按类型集合注入处）**必须**有冒烟入口验证 |
 
 ### 5.16 状态机与聚合
@@ -460,7 +463,7 @@ created ──▶ pending ──▶ running ──▶ { success | failed | skipp
 
 | 编号 | 需求 |
 | --- | --- |
-| FR-RBK-01 | 回退**必须**逆序补偿"已成功且 `compensable()` 为真"的 action（逆序依据：实例行 `auto_id` 降序＝声明/执行逆序） |
+| FR-RBK-01 | 回退**必须**逆序补偿"已成功且 `compensable(ctx)` 为真"的 action（判定在上下文重建、config 激活期解析之后；逆序依据：实例行 `auto_id` 降序＝声明/执行逆序） |
 | FR-RBK-02 | 补偿**不得**改写原 `action_inst.status`（它是不可变的执行事实）；**必须**每个补偿步骤单独写一行 `rollback_record`，状态机 `compensating → compensated | compensate_failed | blocked` |
 | FR-RBK-03 | 遇不可补偿步骤**必须**停下并记 `blocked` + 告警；补偿自身失败**必须**记 `compensate_failed` + 告警且**不无限重试**（当场 break） |
 | FR-RBK-04 | **已成功补偿过的 action 不得重复撤销**（判定：该 action 最新一条 `rollback_record` 是否 `compensated`）。理由：补过再补一次（二次删除/二次回滚别人资源）通常比漏补更糟；`compensate_failed`/`blocked` 仍欠着，下次回退必须再试 |
@@ -612,8 +615,8 @@ handler 返回过程态 = **让渡**：本轮立即退出驱动、状态落库�
 | --- | --- |
 | DM-MAP-01 | 每张实例表的写**必须**收敛为**一条动态 `updateState`**（只写传入的非 null 列），语义入口（`casStatus`/`setStatus`/`markRunning`/`updateStatusResult`/`updateConfig`/`activate`/`updateVars`/`claim`）**必须**是 `default` 快捷而不产生新 SQL |
 | DM-MAP-02 | 查询同理合并：`findRoots`/`findChildren` → `findByParent(procInstId, parentId)`（parentId=null 即根）；`findInContainer`/`findByContainerAndDef` → 一个可空参数的 `findInContainer`；`findByProcess`/`findLatestByAction` → 一个 `find` |
-| DM-MAP-03 | 幂等物化**必须**用 `INSERT ... INSERT IGNORE`（命中唯一键即忽略），保证崩溃后重放不重复插 |
-| DM-MAP-04 | **NULL 参与唯一键不去重**：`uk_node_def_shard(node_inst_id, action_def_id, shard_key)` 在非分片（`shard_key IS NULL`）时不能靠 `INSERT IGNORE` 去重，**必须**先按自然键查、存在则复用（取声明顺序最早一条），否则会产生重复行 |
+| DM-MAP-03 | 插入**必须**用普通 `INSERT`（**禁止** `INSERT IGNORE`：它把唯一键冲突与列约束错误一律降级成警告，出错无从定位）；崩溃后重放不重复插由物化侧保证：节点行按 auto_id 下标对齐缺行才建，lane/action 行按自然键 find-or-create |
+| DM-MAP-04 | **NULL 参与唯一键不去重**：`uk_node_def_shard(node_inst_id, action_def_id, shard_key)` 在非分片（`shard_key IS NULL`）时靠唯一键去不了重，**必须**先按自然键查、存在则复用（取声明顺序最早一条），否则会产生重复行；唯一键只当兜底，撞键就以报错暴露而不被静默吞掉 |
 | DM-MAP-05 | SQL **必须**全部集中在 mapper XML（`META-INF/mapper/process/*.xml`），带显式 `resultMap` 列映射；Java 侧不拼 SQL |
 | DM-MAP-06 | 表名**必须**写成 `${orch.table.*}` 变量（装配期按 `tablePrefix` 一次性文本替换）；变量**必须**显式全部 put（含空串前缀）——PropertyParser 对解不到的占位符原样留在 SQL 里＝语法错误 |
 
@@ -657,7 +660,7 @@ handler 返回过程态 = **让渡**：本轮立即退出驱动、状态落库�
 
 | 编号 | 需求 |
 | --- | --- |
-| NFR-01 | **幂等与可重入**：同一流程可被反复驱动而不重复执行已完成项（节点终态幂等返回、action 非 `created` 跳过、lane/action find-or-create、`INSERT IGNORE`）。这是重试/崩溃恢复/双驱动窗口的共同地基 |
+| NFR-01 | **幂等与可重入**：同一流程可被反复驱动而不重复执行已完成项（节点终态幂等返回、action 非 `created` 跳过、lane/action find-or-create、节点行按 auto_id 下标对齐补建）。这是重试/崩溃恢复/双驱动窗口的共同地基；插入本身用普通 `INSERT`，撞唯一键就报错不留静默 |
 | NFR-02 | **崩溃恢复语义**：半物化的实例行必须由走查按需补齐（LAZY 缺行补建、EAGER 只定位对齐），恢复不重算已完成项、不复算 IF 决策（读 `__chosen`） |
 | NFR-03 | **无事务可接受**：所有多语句写入路径**必须**设计成"可重复调用 + 失败方向安全"（见 FR-INT-05/06、FR-CRT-06），不得依赖回滚 |
 | NFR-04 | **多节点一致**：任何跨节点可见的判定**必须**读 DB（闸门、认领、状态），本机不持有可漂移的权威状态 |
@@ -699,12 +702,12 @@ handler 返回过程态 = **让渡**：本轮立即退出驱动、状态落库�
 | GAP-04 | `ProcessDefinitionMapper` 注释称"枚举按 `name()` 大写绑定、库里是 `DRAFT/PUBLISHED/ARCHIVED`"，与 XML 的 `#{status.status}`（小写）及 DDL 注释冲突 | 以 DM-GEN-06（小写）为准，修正注释 |
 | GAP-05 | `NodeDef.condition` 被解析并落 `condition_expr` 列的通道留给 `when`，`condition` 无任何消费点 | 要么删字段，要么明确其语义；当前**必须**在作者文档标注"写 `condition` 不生效，请用 `when`" |
 | GAP-06 | "未知键即拒"未实现：`load()` 对未识别的顶层段、节点属性、action 属性一律静默忽略（只有 materialization/autoRollback/命名容器成对/引用完整性/纯容器冲突五处会拒） | 增加发布期严格档：白名单校验所有已知键，未识别即拒（错误码续 `AU2042xx`）；按 FR-LOAD-09 落点分档，不得塞进运行期 `load()` |
-| GAP-07 | lane 级桶不持久化：`lane.result`/`lane.config` 列从不写入，分片内 `ctx.upward().putResult` 只在本次内存有效，崩溃重驱动即丢 | 要么补 lane 收尾脏写 `result`，要么在文档规定"分片内跨 action 交接走流程级 `vars` 或业务专表"。禁止保留"看起来能持久、实际不能"的中间态 |
+| GAP-07 | lane 级 `result` **已持久化**：终态收尾写 `status`+`result` 同一条 UPDATE，让渡收尾只写 `result`（行不停终态，见 `CircuitWalk.node`/`LanesWalk.laneMain`），分片内 `ctx.upward().putResult` 的重入交接不再丢；**`lane.config` 列仍从不写入**（引擎没有向 lane 层写 config 的来源，`ContextFactory.lane` 读到的恒为空） | result 按现状保留并有回归用例（`EngineHappyPathTest.shardedLaneResultPersistsAtTerminal`、`EngineYieldTest.shardedLaneResultSurvivesYield`）；config 要么补写入来源，要么在作者文档声明"lane 层不放 config，分片参数走 `${config.*}` 上溯节点/流程或 `shardPayload()`" |
 | GAP-08 | 节点级/泳道级桶是普通 `LinkedHashMap`：`laneExecution: PARALLEL` 时多个 lane 线程可并发写同一 `NodeContext.result`，收尾快照与写入无同步保护（只有 `ProcessContext` 加了锁） | 明确分层并发契约：要么容器桶写入纳入同步（与流程级同口径），要么硬性规定"并行 lane 禁止写节点桶，只写流程级 vars/各自 action 行"，并在作者文档给出 |
 | GAP-09 | `EAGER` + `FAIL_FAST` 下被 `cancel(false)` 的子孙行已预建，会永远停在 `created`（孤儿行），不影响终态但污染进度分母 | 保留现状但写明口径：`total/done` 以 action 行为分母，节点层孤儿行不算未完成；后续可对收敛序列补 drain 置 `stopped` |
 | GAP-10 | ~~业务键列宽三处口径不一~~ **已处置**：DDL 与各处注释统一为 `VARCHAR(32)`，应用侧不再限长（号值格式/长度由宿主序列负责，见 EX-09） | 统一为"列宽 32，引擎不拦格式"，注释与 DDL 对齐 |
-| GAP-11 | ~~`@ComponentScan` 含不存在的包 `com.tesla.ities.process.executor`~~ **已处置**：残留包名已删 | 删除残留包名 |
-| GAP-12 | ~~装配注释仍写"只扫 `com.orchestrator.mapper`"、"SQL 在 `mapper/orchestrator/*.xml`"、"7 张表"~~ **已处置**：按实际改为 `com.tesla.ities.process.mapper`、`META-INF/mapper/process/*.xml`，表数量口径统一为 **8 张**（7 业务表 + 1 调度表，一律随 `tablePrefix`） | 按 DM/CF 章口径刷新注释 |
+| GAP-11 | ~~`@ComponentScan` 含不存在的包 `com.tt.ii.process.executor`~~ **已处置**：残留包名已删 | 删除残留包名 |
+| GAP-12 | ~~装配注释仍写"只扫 `com.orchestrator.mapper`"、"SQL 在 `mapper/orchestrator/*.xml`"、"7 张表"~~ **已处置**：按实际改为 `com.tt.ii.process.mapper`、`META-INF/mapper/process/*.xml`，表数量口径统一为 **8 张**（7 业务表 + 1 调度表，一律随 `tablePrefix`） | 按 DM/CF 章口径刷新注释 |
 | GAP-13 | ~~各 Mapper 接口注释指向 `resources/mapper/orchestrator/*.xml`（旧路径）~~ **已处置**：六处注释统一指向 `resources/META-INF/mapper/process/` | 修正注释路径，避免排障时找不到 SQL |
 
 ---
@@ -723,7 +726,7 @@ handler 返回过程态 = **让渡**：本轮立即退出驱动、状态落库�
 | AC-06 | 全局错误策略回落 | 顶层 `CONTINUE_ON_ERROR` 时未声明的节点逐项跑完；节点自己声明 `FAIL_FAST` 时只影响它自己那层；命名容器声明影响上层序列收敛 |
 | AC-07 | 就近声明优先 | 全局 `CONTINUE_ON_ERROR` 下某个关键根声明 `FAIL_FAST` → 该根坏后跳过剩余 `flow` 根，但 `setdown` 仍执行；全局 `FAIL_FAST` 下锦上添花项声明 `CONTINUE_ON_ERROR` → 失败不拦后面 |
 | AC-08 | 失败记录 | handler 抛异常 → action 行 `failed` + `__error` 带语境与定位；流程行 `result.__error` 只有一条（首个胜出）；重试成功后 `__error` 被摘掉 |
-| AC-09 | 回退 | 逆序补偿 `compensable()` 为真的成功 action；遇不可补偿→`blocked` 并停；重复调用回退不二次撤销（`skipped`）；`rollback_record` 每步一行且不改原 action 状态 |
+| AC-09 | 回退 | 逆序补偿 `compensable(ctx)` 为真的成功 action；遇不可补偿→`blocked` 并停；重复调用回退不二次撤销（`skipped`）；`rollback_record` 每步一行且不改原 action 状态 |
 | AC-10 | 自动回退 | `autoRollback: true` + 终态 `failed/stopped` → 收尾自动补一轮（operator=`auto`）；`paused` 不触发；回退异常不外抛、不改终态 |
 | AC-11 | 人工干预 | `stop` 后在跑的 drain（未发的 action 置 `stopped` + `DRAIN`）；`pause`→`resume` 重新入队；`retry` 复位"没跑成的行"并从头走查（已完成项跳过）；已 `success` 的流程 `retry` 返 `false` 且不动任何行 |
 | AC-12 | 抢先翻状态 | 收尾时人工已把流程翻 `paused/stopped` → 引擎 CAS 失败，**返回并重读 DB 的实际状态**，不覆盖人工意图 |
@@ -758,7 +761,7 @@ handler 返回过程态 = **让渡**：本轮立即退出驱动、状态落库�
 ### 12.1 包结构与类清单（推荐布局）
 
 ```
-com.tesla.ities.process
+com.tt.ii.process
 ├─ api        ProcessFacade（唯一对外门面）· ProcessRequest（链式语法糖）· ProcessExecution（不可变执行结果）
 ├─ config     ProcessEngineConfig（装配入口：数据源/MyBatis/三池/调度器/表前缀）
 ├─ core
@@ -928,6 +931,8 @@ nodes:
 | AU204212 | 并行命名后缀在 nodes 下无声明 | `validateNamedParallels` |
 | AU204213 | 容器形状的节点未被 flow 引用（死配置） | `validateNamedParallels` |
 | AU204214 | 非法 autoRollback 声明值 | `declaredSwitch` |
+| AU204234 | 非法 settleOnStop 声明值 | `declaredSettleSwitch` |
+| AU204235 | 组级段/开关在 `group:` 段内与节点属性上重复声明 | `groupScoped`（`parseNode`） |
 | AU204301 | ACTION 节点行的走查表达式不是叶子 | `ActionKind.drive` |
 | AU204302 | flow 引用了未定义的节点 | 叶子物化 |
 | AU204303 | GROUP 行的走查表达式不是聚合表达式 | `GroupKind.drive` |

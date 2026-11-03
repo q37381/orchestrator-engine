@@ -6,9 +6,9 @@
   注: 本表 status 是发布态(DefinitionStatus 枚举), 与实例运行态 Status 语义不同但持久化口径一致(小写);
   入参是枚举, SQL 经 #{status.status} 取其小写规范值(不注册 TypeHandler)。
 -->
-<mapper namespace="com.tesla.ities.process.mapper.ProcessDefinitionMapper">
+<mapper namespace="com.tt.ii.process.mapper.ProcessDefinitionMapper">
 
-    <resultMap id="BaseResultMap" type="com.tesla.ities.process.domain.ProcessDefinitionEntity">
+    <resultMap id="BaseResultMap" type="com.tt.ii.process.domain.ProcessDefinitionEntity">
         <id     property="autoId"        column="auto_id"/>
         <id     property="processDefId"  column="process_def_id"/>
         <result property="version"       column="version"/>
@@ -39,7 +39,7 @@
         </choose>
     </select>
 
-    <insert id="insert" parameterType="com.tesla.ities.process.domain.ProcessDefinitionEntity">
+    <insert id="insert" parameterType="com.tt.ii.process.domain.ProcessDefinitionEntity">
         INSERT INTO ${orch.table.processDefinition}(process_def_id, version, name, definition, status, created_by, creator_id, updator_id)
         VALUES(#{processDefId}, #{version}, #{name}, #{definition}, #{status}, #{createdBy}, #{creatorId}, #{updatorId})
     </insert>

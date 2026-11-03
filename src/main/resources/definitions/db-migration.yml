@@ -13,7 +13,7 @@ materialization: LAZY
 # errorPolicy: CONTINUE_ON_ERROR
 
 # 可选的自动回退(默认关): 配成 true 后, 本次驱动的终态是 FAILED 或 STOPPED 时, 引擎收尾就当场逆序补偿
-# 已成功且可补偿的 action(handler.compensable()=true 才补, 补过的不重复撤)。不配就照旧只走人工回退入口。
+# 已成功且可补偿的 action(handler.compensable(ctx)=true 才补, 补过的不重复撤)。不配就照旧只走人工回退入口。
 # 只声明在流程级——回退撤销的是整条流程的副作用; 补偿自己的前置/收尾用下面的 rollbackListeners。
 # autoRollback: true
 
@@ -75,7 +75,7 @@ setdown:
 #     setdown:
 #       - id: resumeReplication         # finally 语义: 无论主段成败都执行; 未跑完的 retry 续跑补上
 #         handler: slaveResume
-# 口径: 分片节点每 lane 各跑一遍三段(段内可读 ${lane.shardKey}); 段行落 process_action_inst.segment
+# 口径: 分片节点每 lane 各跑一遍三段; 分片键请在 handler 内用 ctx.shardKey() 取(${lane.shardKey} 不是桶路径)
 # 列(setup|main|setdown), 已成功段重入/重试幂等跳过; 回退只扫主段(段行不参与补偿)。
 
 nodes:
@@ -111,7 +111,8 @@ nodes:
       - id: checkUser
         handler: userChecker
         config:
-          endpoint: "${lane.shardKey}"
+          # endpoint 由 handler 内 ctx.shardKey() 取; 引擎不解析 ${lane.shardKey}(会落 __unresolved)
+          endpoint: "shard-key"
         # action 间相互隔离: checkUser 的 result 不再自动挂节点桶, guard 要读它需**显式交接**——
         # 本例约定 handler 内 ctx.putVar("userExists", ...) / ctx.putVar("userHasPrivilege", ...)
       - id: createUser                       # 声明式守卫: 无用户才执行(guard 读上一步显式写的 vars)
